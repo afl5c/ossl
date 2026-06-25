@@ -6,6 +6,7 @@
  *
  * This implementation provides:
  *   - TLS 1.3 with ECDHE-ECDSA-AES128-GCM-SHA256 and ECDHE-RSA-AES128-GCM-SHA256
+ *   - TLS 1.2 with ECDHE-RSA-AES128-GCM-SHA256 (primary) and RSA key exchange (fallback)
  *   - PEM certificate and private key parsing (DER)
  *   - Platform sockets (WinSock on Windows, BSD sockets elsewhere)
  *   - Self-contained crypto: AES-128/256, RSA (PKCS#1 v1.5 & PSS), SHA-256/SHA-384,

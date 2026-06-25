@@ -1,4 +1,4 @@
-This is a drop-in replacement for OpenSSL, **written entirely by AI** 🤖.
+This is a drop-in replacement for OpenSSL **written entirely by AI** 🤖.
 
  - **Model**: [`deepseek-v4-pro`](https://openrouter.ai/deepseek/deepseek-v4-pro)
  - **Harness**: [CodeWhale](https://github.com/Hmbown/CodeWhale)
@@ -6,9 +6,9 @@ This is a drop-in replacement for OpenSSL, **written entirely by AI** 🤖.
  - **Tokens**: 573 million
  - **Time**: 5 days
  - **Steps**:
-   - Ask the AI to write ossl.h
-   - Ask the AI to write test.c
-   - Ask the AI to write ossl.c
+   - Ask the AI to write `ossl.h`.
+   - Ask the AI to write `test.c`.
+   - Ask the AI to write `ossl.c`.
    - Ask the AI to debug until it works. However, this only implemented TSL 1.2.
    - Ask the AI to add support for TSL 1.3.
    - Ask the AI to review and fix its own code.

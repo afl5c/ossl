@@ -9,7 +9,3 @@
 - Server may send NewSessionTicket after handshake
 - SSL_read skips these records (type 0x04 / 22) but doesn't store tickets
 - Full implementation would store tickets for session resumption
-
-## 3. Additional TLS 1.3 server testing
-- RSA-PSS signatures (sig_algo 0x0804/0x0805) are implemented but untested against real servers
-- ECDSA P-256 (sig_algo 0x0403) verified against example.com; broader server testing still desirable
