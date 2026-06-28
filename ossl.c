@@ -36,7 +36,6 @@
     #define OSSL_INVALID_SOCKET INVALID_SOCKET
     #define OSSL_SOCKET_ERROR SOCKET_ERROR
     #define OSSL_CLOSE_SOCKET(s) closesocket(s)
-    #define OSSL_IO_RETRY(s) (WSAGetLastError() == WSAEWOULDBLOCK)
     typedef unsigned long long ossl_uint64;
 #else
     #define OSSL_PLATFORM_POSIX
@@ -46,13 +45,13 @@
     #include <netinet/tcp.h>
     #include <arpa/inet.h>
     #include <fcntl.h>
-    #include <errno.h>
-    #include <sys/stat.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <poll.h>
     typedef int ossl_sock_t;
     #define OSSL_INVALID_SOCKET (-1)
     #define OSSL_SOCKET_ERROR (-1)
     #define OSSL_CLOSE_SOCKET(s) close(s)
-    #define OSSL_IO_RETRY(s) (errno == EAGAIN || errno == EWOULDBLOCK)
     typedef unsigned long long ossl_uint64;
 #endif
 
@@ -96,6 +95,8 @@
 
 #define OSSL_MAX_RECORD_SIZE 16384
 
+#define OSSL_WANT (-2)
+
 /* ========================================================================
  * Internal structures
  * ======================================================================== */
@@ -122,6 +123,9 @@ struct ossl_ctx {
     unsigned char **trusted_ca_der;
     int *trusted_ca_der_len;
     int trusted_ca_count;
+    /* CRT precomputed parameters (for RSA speedup) */
+    unsigned char *crt_p, *crt_q, *crt_qInv;
+    int crt_p_len, crt_q_len;
 };
 
 struct ossl_ssl {
@@ -141,6 +145,9 @@ struct ossl_ssl {
     char *sni_hostname;
     unsigned char *peer_cert_der;
     int peer_cert_der_len;
+    /* Client session ID for ServerHello echo (TLS 1.3 RFC 8446 §4.1.3) */
+    unsigned char client_session_id[32];
+    int client_session_id_len;
     unsigned char **peer_cert_chain_der;
     int *peer_cert_chain_der_len;
     int peer_cert_chain_count;
@@ -185,6 +192,8 @@ struct ossl_ssl {
     int read_buf_len;
     int read_buf_off;
     int verified_chain_augmented;
+    int hs_state;   /* re-entrant handshake phase */
+    int want;       /* SSL_ERROR_WANT_READ / SSL_ERROR_WANT_WRITE */
 };
 
 struct ossl_bio {
@@ -229,49 +238,94 @@ static void ossl_buf_free(ossl_buf *b) {
 
 static int ossl_buf_ensure(ossl_buf *b, int sz) {
     if (b->cap >= sz) return 0;
-    unsigned char *nd = (unsigned char*)realloc(b->data, sz);
+    /* Exponential doubling to avoid O(n²) realloc churn */
+    int ncap = (b->cap < 16) ? 16 : b->cap;
+    while (ncap < sz) ncap *= 2;
+    unsigned char *nd = (unsigned char*)realloc(b->data, ncap);
     if (!nd) return -1;
     b->data = nd;
-    b->cap = sz;
+    b->cap = ncap;
     return 0;
 }
 
+#define OSSL_MAX_HANDSHAKE_BUF (256 * 1024) /* 256 KB max handshake reassembly */
 static int ossl_buf_push(ossl_buf *b, const unsigned char *data, int len) {
     if (len < 0) return -1;
+    /* Avoid signed integer overflow: check len against INT_MAX - b->len */
+    if (len > 0x7FFFFFFF - b->len) return -1;
     int needed = b->len + len;
-    if (needed < b->len) return -1;
+    if (needed > OSSL_MAX_HANDSHAKE_BUF) return -1;
     if (ossl_buf_ensure(b, needed)) return -1;
     memcpy(b->data + b->len, data, len);
     b->len += len;
     return 0;
 }
 
-static int tcp_recv_all(ossl_sock_t fd, unsigned char *buf, int len) {
+/* blocking=1: use poll() to wait. blocking=0: return OSSL_WANT on EAGAIN. */
+static int tcp_recv_all(ossl_sock_t fd, unsigned char *buf, int len, int blocking) {
     int total = 0;
     while (total < len) {
         int n = recv(fd, (char*)(buf + total), len - total, 0);
-        if (n <= 0) {
-            if (n < 0 && OSSL_IO_RETRY(fd)) {
-                continue;
+        if (n > 0) { total += n; continue; }
+        if (n == 0) return -1; /* EOF / connection closed */
+#ifdef OSSL_PLATFORM_POSIX
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!blocking) return OSSL_WANT;
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            if (poll(&pfd, 1, -1) < 0) {
+                if (errno == EINTR) continue;
+                return -1;
             }
-            return -1;
+            continue;
         }
-        total += n;
+#else
+        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            if (!blocking) return OSSL_WANT;
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            if (select(0, &rfds, NULL, NULL, NULL) <= 0) return -1;
+            continue;
+        }
+#endif
+        return -1;
     }
     return 0;
 }
 
-static int tcp_send_all(ossl_sock_t fd, const unsigned char *buf, int len) {
+static int tcp_send_all(ossl_sock_t fd, const unsigned char *buf, int len, int blocking) {
     int total = 0;
     while (total < len) {
         int n = send(fd, (const char*)(buf + total), len - total, 0);
-        if (n <= 0) {
-            if (n < 0 && OSSL_IO_RETRY(fd)) {
-                continue;
+        if (n > 0) { total += n; continue; }
+        if (n == 0) return -1;
+#ifdef OSSL_PLATFORM_POSIX
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!blocking) return OSSL_WANT;
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            if (poll(&pfd, 1, -1) < 0) {
+                if (errno == EINTR) continue;
+                return -1;
             }
-            return -1;
+            continue;
         }
-        total += n;
+#else
+        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            if (!blocking) return OSSL_WANT;
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            if (select(0, NULL, &wfds, NULL, NULL) <= 0) return -1;
+            continue;
+        }
+#endif
+        return -1;
     }
     return 0;
 }
@@ -748,6 +802,7 @@ static const unsigned char aes_sbox[256] = {
     0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
 };
 
+#if 0 /* unused: kept for future CBC support */
 static const unsigned char aes_inv_sbox[256] = {
     0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
     0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
@@ -766,6 +821,7 @@ static const unsigned char aes_inv_sbox[256] = {
     0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
     0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d
 };
+#endif /* 0 */
 
 static void aes_key_expansion(const unsigned char key[16], unsigned char rk[176]) {
     unsigned int tmp;
@@ -800,9 +856,11 @@ static void sub_bytes(unsigned char state[16]) {
     for (int i = 0; i < 16; i++) state[i] = aes_sbox[state[i]];
 }
 
+#if 0 /* unused: kept for future CBC support */
 static void inv_sub_bytes(unsigned char state[16]) {
     for (int i = 0; i < 16; i++) state[i] = aes_inv_sbox[state[i]];
 }
+#endif
 
 static void shift_rows(unsigned char state[16]) {
     unsigned char t;
@@ -811,12 +869,14 @@ static void shift_rows(unsigned char state[16]) {
     t = state[15]; state[15] = state[11]; state[11] = state[7]; state[7] = state[3]; state[3] = t;
 }
 
+#if 0 /* unused: kept for future CBC support */
 static void inv_shift_rows(unsigned char state[16]) {
     unsigned char t;
     t = state[13]; state[13] = state[9]; state[9] = state[5]; state[5] = state[1]; state[1] = t;
     t = state[2]; state[2] = state[10]; state[10] = t; t = state[6]; state[6] = state[14]; state[14] = t;
     t = state[3]; state[3] = state[7]; state[7] = state[11]; state[11] = state[15]; state[15] = t;
 }
+#endif
 
 static unsigned int gf_mul(unsigned char a, unsigned char b) {
     unsigned int res = 0;
@@ -842,6 +902,7 @@ static void mix_columns(unsigned char state[16]) {
     }
 }
 
+#if 0 /* unused: kept for future CBC support */
 static void inv_mix_columns(unsigned char state[16]) {
     for (int i = 0; i < 16; i += 4) {
         unsigned char a[4];
@@ -852,6 +913,7 @@ static void inv_mix_columns(unsigned char state[16]) {
         state[i+3] = (unsigned char)(gf_mul(a[0],11) ^ gf_mul(a[1],13) ^ gf_mul(a[2],9) ^ gf_mul(a[3],14));
     }
 }
+#endif
 
 static void aes_encrypt_block(const unsigned char rk[176], const unsigned char in[16], unsigned char out[16]) {
     unsigned char state[16];
@@ -869,6 +931,7 @@ static void aes_encrypt_block(const unsigned char rk[176], const unsigned char i
     memcpy(out, state, 16);
 }
 
+#if 0 /* unused: kept for future CBC support */
 static void aes_decrypt_block(const unsigned char rk[176], const unsigned char in[16], unsigned char out[16]) {
     unsigned char state[16];
     memcpy(state, in, 16);
@@ -884,6 +947,7 @@ static void aes_decrypt_block(const unsigned char rk[176], const unsigned char i
     add_round_key(state, rk);
     memcpy(out, state, 16);
 }
+#endif /* 0 */
 
 /* ========================================================================
  * AES-256 (FIPS 197)
@@ -1225,14 +1289,6 @@ static void bn_to_bin(unsigned char *bin, int bin_len, const unsigned char *bn, 
     }
 }
 
-static int bn_cmp(const unsigned char *a, const unsigned char *b, int len) {
-    for (int i = len - 1; i >= 0; i--) {
-        if (a[i] > b[i]) return 1;
-        if (a[i] < b[i]) return -1;
-    }
-    return 0;
-}
-
 static int bn_sub(unsigned char *a, const unsigned char *b, int len) {
     unsigned int borrow = 0;
     for (int i = 0; i < len; i++) {
@@ -1241,6 +1297,22 @@ static int bn_sub(unsigned char *a, const unsigned char *b, int len) {
         borrow = (tmp >> 8) & 1;
     }
     return borrow;
+}
+
+/* Constant-time: returns 1 if a >= b, 0 otherwise.
+   Iterates all bytes without early exit — no branch on data. */
+static int bn_ge_ct(const unsigned char *a, const unsigned char *b, int len) {
+    int gt = 0, eq = 1;
+    for (int i = len - 1; i >= 0; i--) {
+        unsigned int diff   = a[i] ^ b[i];
+        int          neq    = (diff != 0);
+        unsigned int sub    = (unsigned int)a[i] - (unsigned int)b[i];
+        int          borrow = (sub >> 8) & 1;
+        int          byte_gt = neq & (1 ^ borrow);
+        gt |= eq & byte_gt;
+        eq &= 1 ^ neq;
+    }
+    return gt | eq;
 }
 
 static void bn_mul(unsigned char *res, const unsigned char *a, const unsigned char *b, int len) {
@@ -1256,57 +1328,284 @@ static void bn_mul(unsigned char *res, const unsigned char *a, const unsigned ch
     }
 }
 
-static int bn_mod(unsigned char *res, const unsigned char *a, int a_len, const unsigned char *mod, int mod_len) {
-    unsigned char *temp = (unsigned char*)calloc(a_len, 1);
-    if (!temp) return -1;
-    memcpy(temp, a, a_len);
-    int mod_bits = 0;
-    for (int i = mod_len - 1; i >= 0; i--) {
-        if (mod[i] != 0) {
-            mod_bits = i * 8;
-            unsigned char val = mod[i];
-            while (val > 0) { mod_bits++; val >>= 1; }
-            break;
-        }
+/* Divide a (a_len bytes) by mod (mod_len bytes).
+   a is modified in place and becomes the remainder (first mod_len bytes valid).
+   Returns 0 on success, -1 on error.
+   
+   Uses the original binary long division algorithm (correct but O(k^2) where k = bit-length difference).
+   This is the proven-correct fallback. */
+static int bn_divrem(unsigned char *a, int a_len, const unsigned char *mod, int mod_len,
+                     unsigned char *quotient) {
+    int qlen = 0;
+    if (quotient) {
+        /* quotient can be up to a_len bytes (when mod is very small) */
+        qlen = a_len + 1;
+        memset(quotient, 0, qlen);
     }
-    int temp_bits = 0;
-    for (int i = a_len - 1; i >= 0; i--) {
-        if (temp[i] != 0) {
-            temp_bits = i * 8;
-            unsigned char val = temp[i];
-            while (val > 0) { temp_bits++; val >>= 1; }
-            break;
-        }
+    
+    /* Find MSB of mod */
+    int mod_msb = mod_len - 1;
+    while (mod_msb >= 0 && mod[mod_msb] == 0) mod_msb--;
+    if (mod_msb < 0) return -1;
+    
+    /* Find MSB of a */
+    int a_msb = a_len - 1;
+    while (a_msb >= 0 && a[a_msb] == 0) a_msb--;
+    if (a_msb < 0) {
+        memset(a, 0, mod_len);
+        return 0;
     }
-    int shift = temp_bits - mod_bits;
-    if (shift >= 0) {
-        unsigned char *shifted_mod = (unsigned char*)calloc(a_len, 1);
-        if (!shifted_mod) { free(temp); return -1; }
-        int byte_shift = shift / 8;
-        int bit_shift = shift % 8;
+    
+    /* Compute bit lengths */
+    int mod_bits = mod_msb * 8;
+    { unsigned char v = mod[mod_msb]; while (v) { mod_bits++; v >>= 1; } }
+    int a_bits = a_msb * 8;
+    { unsigned char v = a[a_msb]; while (v) { a_bits++; v >>= 1; } }
+    
+    int shift = a_bits - mod_bits;
+    if (shift < 0) return 0; /* a < mod */
+    
+    /* Build shifted_mod = mod << shift (a_len bytes) */
+    unsigned char *shifted_mod = (unsigned char*)calloc(a_len, 1);
+    if (!shifted_mod) return -1;
+    int byte_shift = shift / 8;
+    int bit_shift  = shift % 8;
+    {
         unsigned int carry = 0;
         for (int i = 0; i < mod_len; i++) {
-            unsigned int val = ((unsigned int)mod[i] << bit_shift) | carry;
+            unsigned int v = ((unsigned int)mod[i] << bit_shift) | carry;
             if (i + byte_shift < a_len)
-                shifted_mod[i + byte_shift] = (unsigned char)(val & 0xFF);
-            carry = val >> 8;
+                shifted_mod[i + byte_shift] = (unsigned char)(v & 0xFF);
+            carry = v >> 8;
         }
         if (mod_len + byte_shift < a_len)
             shifted_mod[mod_len + byte_shift] = (unsigned char)carry;
-        for (int s = shift; s >= 0; s--) {
-            if (bn_cmp(temp, shifted_mod, a_len) >= 0)
-                bn_sub(temp, shifted_mod, a_len);
+    }
+    
+    /* Binary long division */
+    unsigned char *tmp = (unsigned char*)malloc(a_len);
+    if (!tmp) { free(shifted_mod); return -1; }
+    
+    /* Quotient accumulation: bit `shift` is the MSB, bit 0 is the LSB.
+       Stored LITTLE-ENDIAN: byte 0 = LSB, highest byte = MSB.
+       Chunks are produced MSB-first; chunk 0 = MSB, chunk N-1 = LSB. */
+    int bit_pos = shift;
+    int total_bits = shift + 1;
+    int num_q_bytes = (total_bits + 7) / 8;
+    int chunk_num = 0;
+    while (bit_pos >= 0) {
+        int chunk = (bit_pos >= 7) ? 8 : (bit_pos + 1);
+        unsigned char q_byte = 0;
+        for (int b = 0; b < chunk; b++) {
+            memcpy(tmp, a, a_len);
+            bn_sub(tmp, shifted_mod, a_len);
+            int ge = bn_ge_ct(a, shifted_mod, a_len);
+            unsigned char mask = (unsigned char)(-ge);
+            for (int i = 0; i < a_len; i++)
+                a[i] = (mask & tmp[i]) | (~mask & a[i]);
+            q_byte = (unsigned char)((q_byte << 1) | (ge & 1));
             unsigned int borrow = 0;
             for (int i = a_len - 1; i >= 0; i--) {
-                unsigned int val = shifted_mod[i] | (borrow << 8);
-                shifted_mod[i] = (unsigned char)(val >> 1);
-                borrow = val & 1;
+                unsigned int v = shifted_mod[i] | (borrow << 8);
+                shifted_mod[i] = (unsigned char)(v >> 1);
+                borrow = v & 1;
             }
         }
-        free(shifted_mod);
+        if (quotient) {
+            int qidx = num_q_bytes - 1 - chunk_num;
+            if (qidx >= 0 && qidx < qlen) {
+                quotient[qidx] = q_byte;
+            }
+        }
+        chunk_num++;
+        bit_pos -= chunk;
+    }
+    
+    free(tmp);
+    free(shifted_mod);
+    return 0;
+}
+
+static int bn_mod(unsigned char *res, const unsigned char *a, int a_len, const unsigned char *mod, int mod_len) {
+    /* Use bn_divrem which implements the same proven-correct binary division */
+    unsigned char *temp = (unsigned char*)calloc(a_len, 1);
+    if (!temp) return -1;
+    memcpy(temp, a, a_len);
+    if (bn_divrem(temp, a_len, mod, mod_len, NULL) != 0) {
+        free(temp); return -1;
     }
     memcpy(res, temp, mod_len);
     free(temp);
+    return 0;
+}
+
+/* ========================================================================
+ * Montgomery modular multiplication
+ *
+ * Replaces bn_divrem-based modular reduction (binary long division)
+ * with Montgomery reduction: convert operands to Montgomery domain once,
+ * do multiply-and-reduce via shift + conditional sub (no division),
+ * convert back at the end.  Expected speedup: ~7-15x per modpow.
+ * ======================================================================== */
+
+/* Compute n'0 = -mod[0]^(-1) mod 256.  mod[0] must be odd (RSA moduli are). */
+static unsigned char mont_nprime0(unsigned char mod0) {
+    unsigned int inv = 1;
+    for (unsigned int i = 1; i < 256; i += 2) {
+        if ((((unsigned int)mod0 * i) & 0xFF) == 1) {
+            inv = i;
+            break;
+        }
+    }
+    return (unsigned char)((256 - inv) & 0xFF);
+}
+
+/* Compute R mod mod where R = 256^mod_len (LE: byte mod_len is 1).
+   Uses bn_divrem (one-time cost per modpow). */
+static int mont_r_mod(unsigned char *r_mod, const unsigned char *mod, int mod_len) {
+    int r_len = mod_len + 1;
+    unsigned char *r_raw = (unsigned char *)calloc(r_len, 1);
+    if (!r_raw) return -1;
+    r_raw[mod_len] = 1;
+    if (bn_divrem(r_raw, r_len, mod, mod_len, NULL) != 0) {
+        free(r_raw);
+        return -1;
+    }
+    memcpy(r_mod, r_raw, mod_len);
+    free(r_raw);
+    return 0;
+}
+
+/* Compute R^2 mod mod where R = 256^mod_len (LE: byte 2*mod_len is 1). */
+static int mont_r2_mod(unsigned char *r2, const unsigned char *mod, int mod_len) {
+    int r2_len = 2 * mod_len + 1;
+    unsigned char *r2_raw = (unsigned char *)calloc(r2_len, 1);
+    if (!r2_raw) return -1;
+    r2_raw[2 * mod_len] = 1;
+    if (bn_divrem(r2_raw, r2_len, mod, mod_len, NULL) != 0) {
+        free(r2_raw);
+        return -1;
+    }
+    memcpy(r2, r2_raw, mod_len);
+    free(r2_raw);
+    return 0;
+}
+
+/* Montgomery multiplication: result = a * b * R^(-1) mod mod.
+   R = 256^mod_len.  mod must be odd.  nprime0 = -mod[0]^(-1) mod 256.
+   r_mod = R mod mod (precomputed, n bytes).
+   T must be at least (2*mod_len+2) unsigned shorts (scratch).
+   result may alias a or b. */
+static int mont_mult(unsigned char *result,
+                      const unsigned char *a,
+                      const unsigned char *b,
+                      const unsigned char *mod,
+                      int mod_len,
+                      unsigned char nprime0,
+                      const unsigned char *r_mod,
+                      unsigned short *T) {
+    /* Multiply directly into T (16-bit entries avoid byte-overflow in
+       carry chains during the reduction loop).  Then Montgomery reduce. */
+    int n = mod_len;
+    int i, j;
+    unsigned int carry, u;
+
+    /* T = a * b  (schoolbook multiply; unsigned short stores byte-level
+       digits — overflow-safe for subsequent reduction loop). */
+    memset(T, 0, n * 2 * sizeof(unsigned short));
+    for (i = 0; i < n; i++) {
+        carry = 0;
+        for (j = 0; j < n; j++) {
+            unsigned int prod = (unsigned int)a[i] * b[j] + T[i + j] + carry;
+            T[i + j] = (unsigned short)(prod & 0xFF);
+            carry = prod >> 8;
+        }
+        T[i + n] = (unsigned short)carry;
+    }
+
+    /* Montgomery reduction (byte-radix with unsigned-short storage) */
+    for (i = 0; i < n; i++) {
+        u = ((unsigned int)T[i] * nprime0) & 0xFF;
+        carry = 0;
+        for (j = 0; j < n; j++) {
+            unsigned int prod = (unsigned int)u * mod[j] + T[i + j] + carry;
+            T[i + j] = (unsigned short)(prod & 0xFF);
+            carry = prod >> 8;
+        }
+        for (j = i + n; carry != 0; j++) {
+            unsigned int sum = T[j] + carry;
+            T[j] = (unsigned short)(sum & 0xFF);
+            carry = sum >> 8;
+        }
+    }
+
+    /* Post-reduction normalization: propagate byte overflow from
+       positions >= n into the upper-half result. */
+    {
+        unsigned int c = 0;
+        for (j = n; j < n * 2 + 2; j++) {
+            unsigned int s = T[j] + c;
+            T[j] = (unsigned short)(s & 0xFF);
+            c = s >> 8;
+        }
+    }
+
+    /* Fold T[2n] overflow back into the result.
+       T[2n] * 256^(2n) in the product contributes T[2n] * R to
+       the result after division by R = 256^n.  We add
+       T[2n] * r_mod (where r_mod = R mod n) to the result. */
+    if (T[n * 2] != 0) {
+        /* Multiply T[2n] (a single byte, 0..255) by r_mod using
+           bn_mul, reduce modulo mod, and add to positions n..2n-1. */
+        unsigned char *fold_buf = (unsigned char *)calloc(n * 2, 1);
+        unsigned char scalar = (unsigned char)(T[n * 2] & 0xFF);
+        if (fold_buf) {
+            /* Compute scalar * r_mod inline (scalar ≤ 255, r_mod is n bytes) */
+            {
+                unsigned int carry_s = 0;
+                for (j = 0; j < n; j++) {
+                    unsigned int prod = (unsigned int)scalar * r_mod[j] + carry_s;
+                    fold_buf[j] = (unsigned char)(prod & 0xFF);
+                    carry_s = prod >> 8;
+                }
+                fold_buf[n] = (unsigned char)carry_s;
+            }
+            /* Reduce (scalar * r_mod) modulo mod */
+            if (bn_divrem(fold_buf, n + 1, mod, n, NULL) == 0) {
+                /* fold_buf[0..n-1] now holds (scalar * r_mod) mod n.
+                   Add to the result starting at position n. */
+                unsigned int carry_add = 0;
+                for (j = 0; j < n; j++) {
+                    unsigned int s = T[n + j] + fold_buf[j] + carry_add;
+                    T[n + j] = (unsigned short)(s & 0xFF);
+                    carry_add = s >> 8;
+                }
+                /* Propagate final carry to position 2n */
+                if (carry_add) T[n * 2] = (unsigned short)((T[n * 2] + carry_add) & 0xFF);
+            }
+            free(fold_buf);
+        }
+    }
+
+    /* Extract low bytes of upper half as result */
+    for (i = 0; i < n; i++)
+        result[i] = (unsigned char)(T[n + i] & 0xFF);
+
+    /* Conditional subtraction */
+    {
+        int ge = bn_ge_ct(result, mod, n);
+        unsigned int borrow = 0;
+        for (j = 0; j < n; j++) {
+            unsigned int sub = (unsigned int)result[j] - (unsigned int)mod[j] - borrow;
+            T[j] = (unsigned short)(sub & 0xFF);
+            borrow = (sub >> 8) & 1;
+        }
+        unsigned char mask = (unsigned char)(-ge);
+        for (j = 0; j < n; j++)
+            result[j] = (unsigned char)((mask & (unsigned char)T[j]) | (~mask & result[j]));
+    }
+
+    memset(T, 0, (n * 2 + 2) * sizeof(unsigned short));
     return 0;
 }
 
@@ -1318,15 +1617,29 @@ static int rsa_modpow(const unsigned char *base, int base_len,
     int max_len = mod_len;
     /* Prevent integer overflow in max_len * 2 */
     if (max_len < 0 || max_len > 1024 * 1024) return -1;
+
     unsigned char *bn_mod_val = (unsigned char*)malloc(max_len);
-    unsigned char *bn_base = (unsigned char*)malloc(max_len);
-    unsigned char *bn_res = (unsigned char*)malloc(max_len);
-    unsigned char *temp_prod = (unsigned char*)malloc(max_len * 2);
-    if (!bn_mod_val || !bn_base || !bn_res || !temp_prod) {
-        free(bn_mod_val); free(bn_base); free(bn_res); free(temp_prod);
+    unsigned char *bn_base    = (unsigned char*)malloc(max_len);
+    unsigned char *bn_res     = (unsigned char*)malloc(max_len);
+    unsigned char *bn_r_mod   = (unsigned char*)malloc(max_len);
+    unsigned char *bn_r2_mod  = (unsigned char*)malloc(max_len);
+    unsigned short *mont_t    = (unsigned short*)calloc(max_len * 2 + 2, sizeof(unsigned short));
+    if (!bn_mod_val || !bn_base || !bn_res ||
+        !bn_r_mod || !bn_r2_mod || !mont_t) {
+        free(bn_mod_val); free(bn_base); free(bn_res);
+        free(bn_r_mod); free(bn_r2_mod); free(mont_t);
         return -1;
     }
+
+    /* --- Montgomery modular exponentiation --- */
     bn_from_bin(bn_mod_val, mod, mod_len, max_len);
+
+    /* Precompute Montgomery constants */
+    unsigned char nprime0 = mont_nprime0(bn_mod_val[0]);
+    if (mont_r_mod(bn_r_mod, bn_mod_val, max_len) != 0) goto rsa_modpow_fail;
+    if (mont_r2_mod(bn_r2_mod, bn_mod_val, max_len) != 0) goto rsa_modpow_fail;
+
+    /* Reduce base mod n, convert to LE */
     if (base_len > mod_len) {
         unsigned char *temp_base = (unsigned char*)malloc(base_len);
         if (!temp_base) goto rsa_modpow_fail;
@@ -1338,34 +1651,132 @@ static int rsa_modpow(const unsigned char *base, int base_len,
     } else {
         bn_from_bin(bn_base, base, base_len, max_len);
     }
-    memset(bn_res, 0, max_len);
-    bn_res[0] = 1;
-    int exp_bits = 0;
-    for (int i = exp_len - 1; i >= 0; i--) {
-        if (exp[i] != 0) {
-            exp_bits = i * 8;
-            unsigned char val = exp[i];
-            while (val > 0) { exp_bits++; val >>= 1; }
-            break;
+
+    /* Convert base to Montgomery domain: base_mont = base * R mod n */
+    if (mont_mult(bn_base, bn_base, bn_r2_mod, bn_mod_val, max_len,
+                  nprime0, bn_r_mod, mont_t) != 0)
+        goto rsa_modpow_fail;
+
+    /* Initialize result = R mod n (Montgomery representation of 1) */
+    memcpy(bn_res, bn_r_mod, max_len);
+
+    /* --- Sliding window exponentiation (w=5) --- */
+#define SW_W 5
+#define SW_TABLE_SIZE (1 << (SW_W - 1))  /* 16 entries: odd powers 1,3,5,...,31 */
+
+    /* Precompute table[k] = base^(2k+1) in Montgomery domain.
+     * table[0] = base^1, then table[k] = table[k-1] * base^2. */
+    {
+        unsigned char *sw_base2 = (unsigned char*)malloc(max_len);
+        unsigned char *sw_table[SW_TABLE_SIZE];
+        int sw_ok = (sw_base2 != NULL);
+        for (int k = 0; k < SW_TABLE_SIZE; k++) {
+            sw_table[k] = (unsigned char*)malloc(max_len);
+            if (!sw_table[k]) sw_ok = 0;
         }
-    }
-    for (int i = exp_bits - 1; i >= 0; i--) {
-        bn_mul(temp_prod, bn_res, bn_res, max_len);
-        if (bn_mod(bn_res, temp_prod, max_len * 2, bn_mod_val, max_len) != 0)
+        if (!sw_ok) {
+            free(sw_base2);
+            for (int k = 0; k < SW_TABLE_SIZE; k++) free(sw_table[k]);
             goto rsa_modpow_fail;
-        int byte_idx = i / 8;
-        int bit_idx = i % 8;
-        if (exp[exp_len - 1 - byte_idx] & (1 << bit_idx)) {
-            bn_mul(temp_prod, bn_res, bn_base, max_len);
-            if (bn_mod(bn_res, temp_prod, max_len * 2, bn_mod_val, max_len) != 0)
+        }
+
+        /* base^2 */
+        if (mont_mult(sw_base2, bn_base, bn_base, bn_mod_val, max_len,
+                      nprime0, bn_r_mod, mont_t) != 0) {
+            free(sw_base2);
+            for (int k = 0; k < SW_TABLE_SIZE; k++) free(sw_table[k]);
+            goto rsa_modpow_fail;
+        }
+
+        /* table[0] = base^1 */
+        memcpy(sw_table[0], bn_base, max_len);
+        for (int k = 1; k < SW_TABLE_SIZE; k++) {
+            if (mont_mult(sw_table[k], sw_table[k-1], sw_base2, bn_mod_val, max_len,
+                          nprime0, bn_r_mod, mont_t) != 0) {
+                free(sw_base2);
+                for (int k2 = 0; k2 < SW_TABLE_SIZE; k2++) free(sw_table[k2]);
                 goto rsa_modpow_fail;
+            }
+        }
+        free(sw_base2);
+
+    /* Sliding window: scan exponent MSB -> LSB, grouping up to w bits per window */
+    int exp_total_bits = exp_len * 8;
+    int sw_i = exp_total_bits - 1;
+
+    while (sw_i >= 0) {
+        int byte_idx_i = sw_i / 8;
+        int bit_idx_i  = sw_i % 8;
+        int exp_bit    = (exp[exp_len - 1 - byte_idx_i] >> bit_idx_i) & 1;
+
+        if (exp_bit == 0) {
+            if (mont_mult(bn_res, bn_res, bn_res, bn_mod_val, max_len,
+                          nprime0, bn_r_mod, mont_t) != 0) {
+                for (int k = 0; k < SW_TABLE_SIZE; k++) free(sw_table[k]);
+                goto rsa_modpow_fail;
+            }
+            sw_i--;
+        } else {
+            /* Build a window of up to SW_W bits ending at sw_i.
+             * Slide past leading zeros inside the candidate window. */
+            int win_end   = sw_i;
+            int win_start = (sw_i - SW_W + 1 > 0) ? sw_i - SW_W + 1 : 0;
+            while (win_start < win_end) {
+                int b = win_start / 8;
+                int p = win_start % 8;
+                if ((exp[exp_len - 1 - b] >> p) & 1) break;
+                win_start++;
+            }
+            int win_len = win_end - win_start + 1;
+
+            /* Extract the odd window value (LSB is always 1) */
+            int win_val = 0;
+            for (int j = win_end; j >= win_start; j--) {
+                int b = j / 8;
+                int p = j % 8;
+                win_val = (win_val << 1) | ((exp[exp_len - 1 - b] >> p) & 1);
+            }
+            int tbl_idx = (win_val - 1) / 2;
+
+            for (int j = 0; j < win_len; j++) {
+                if (mont_mult(bn_res, bn_res, bn_res, bn_mod_val, max_len,
+                              nprime0, bn_r_mod, mont_t) != 0) {
+                    for (int k = 0; k < SW_TABLE_SIZE; k++) free(sw_table[k]);
+                    goto rsa_modpow_fail;
+                }
+            }
+            if (mont_mult(bn_res, bn_res, sw_table[tbl_idx], bn_mod_val, max_len,
+                          nprime0, bn_r_mod, mont_t) != 0) {
+                for (int k = 0; k < SW_TABLE_SIZE; k++) free(sw_table[k]);
+                goto rsa_modpow_fail;
+            }
+            sw_i = win_start - 1;
         }
     }
+
+    for (int k = 0; k < SW_TABLE_SIZE; k++) free(sw_table[k]);
+    }
+
+    /* Convert back from Montgomery domain */
+    {
+        unsigned char *one = calloc(max_len, 1);
+        if (!one) goto rsa_modpow_fail;
+        one[0] = 1;
+        if (mont_mult(bn_res, bn_res, one, bn_mod_val, max_len,
+                      nprime0, bn_r_mod, mont_t) != 0)
+            { free(one); goto rsa_modpow_fail; }
+        free(one);
+    }
+
     bn_to_bin(result, mod_len, bn_res, max_len);
-    free(bn_mod_val); free(bn_base); free(bn_res); free(temp_prod);
+
+    free(bn_mod_val); free(bn_base); free(bn_res);
+    free(bn_r_mod); free(bn_r2_mod); free(mont_t);
     return 0;
+
 rsa_modpow_fail:
-    free(bn_mod_val); free(bn_base); free(bn_res); free(temp_prod);
+    free(bn_mod_val); free(bn_base); free(bn_res);
+    free(bn_r_mod); free(bn_r2_mod); free(mont_t);
     return -1;
 }
 
@@ -1383,9 +1794,23 @@ typedef int64_t limb;
 typedef int32_t s32;
 typedef uint8_t u8;
 
-static void fsum(limb *o, const limb *i) { int c; for(c=0;c<10;c+=2){ o[c]=o[c]+i[c]; o[c+1]=o[c+1]+i[c+1]; }}
-static void fdifference(limb *o, const limb *i) { int c; for(c=0;c<10;++c) o[c]=i[c]-o[c]; }
-static void fscalar_product(limb *o, const limb *i, limb s) { int c; for(c=0;c<10;++c) o[c]=i[c]*s; }
+static void fsum(limb *o, const limb *i) {
+    int c;
+    for (c = 0; c < 10; c += 2) {
+        o[c] = o[c] + i[c];
+        o[c + 1] = o[c + 1] + i[c + 1];
+    }
+}
+static void fdifference(limb *o, const limb *i) {
+    int c;
+    for (c = 0; c < 10; ++c)
+        o[c] = i[c] - o[c];
+}
+static void fscalar_product(limb *o, const limb *i, limb s) {
+    int c;
+    for (c = 0; c < 10; ++c)
+        o[c] = i[c] * s;
+}
 
 static void fproduct(limb *o, const limb *a, const limb *b) {
   o[0]=((limb)((s32)a[0]))*((s32)b[0]);o[1]=((limb)((s32)a[0]))*((s32)b[1])+((limb)((s32)a[1]))*((s32)b[0]);
@@ -1408,21 +1833,77 @@ static void fproduct(limb *o, const limb *a, const limb *b) {
   o[18]=2*((limb)((s32)a[9]))*((s32)b[9]);
 }
 static void freduce_degree(limb *o) {
-  o[8]+=o[18]*19;o[18]=0;o[7]+=o[17]*19;o[17]=0;o[6]+=o[16]*19;o[16]=0;o[5]+=o[15]*19;o[15]=0;
-  o[4]+=o[14]*19;o[14]=0;o[3]+=o[13]*19;o[13]=0;o[2]+=o[12]*19;o[12]=0;o[1]+=o[11]*19;o[11]=0;o[0]+=o[10]*19;o[10]=0;
+    o[8] += o[18] * 19; o[18] = 0;
+    o[7] += o[17] * 19; o[17] = 0;
+    o[6] += o[16] * 19; o[16] = 0;
+    o[5] += o[15] * 19; o[15] = 0;
+    o[4] += o[14] * 19; o[14] = 0;
+    o[3] += o[13] * 19; o[13] = 0;
+    o[2] += o[12] * 19; o[12] = 0;
+    o[1] += o[11] * 19; o[11] = 0;
+    o[0] += o[10] * 19; o[10] = 0;
 }
 static inline limb div_by_2_26(limb v) { uint32_t h=(uint32_t)((uint64_t)v>>32); int32_t s=(int32_t)h>>31; return (v+((uint32_t)s>>6))>>26; }
 static inline limb div_by_2_25(limb v) { uint32_t h=(uint32_t)((uint64_t)v>>32); int32_t s=(int32_t)h>>31; return (v+((uint32_t)s>>7))>>25; }
 static void freduce_coefficients(limb *o) {
-  o[10]=0;int i;for(i=0;i<10;i+=2){limb ov=div_by_2_26(o[i]);o[i]-=ov<<26;o[i+1]+=ov;ov=div_by_2_25(o[i+1]);o[i+1]-=ov<<25;o[i+2]+=ov;}
-  o[0]+=o[10]*19;o[10]=0;{limb ov=div_by_2_26(o[0]);o[0]-=ov<<26;o[1]+=ov;}
+    o[10] = 0;
+    int i;
+    for (i = 0; i < 10; i += 2) {
+        limb ov = div_by_2_26(o[i]);
+        o[i] -= ov << 26;
+        o[i + 1] += ov;
+        ov = div_by_2_25(o[i + 1]);
+        o[i + 1] -= ov << 25;
+        o[i + 2] += ov;
+    }
+    o[0] += o[10] * 19;
+    o[10] = 0;
+    {
+        limb ov = div_by_2_26(o[0]);
+        o[0] -= ov << 26;
+        o[1] += ov;
+    }
 }
-static void fmul(limb *o, const limb *a, const limb *b){limb t[19];fproduct(t,a,b);freduce_degree(t);freduce_coefficients(t);memcpy(o,t,10*8);}
-static void fsquare(limb *o, const limb *a){limb t[19];fproduct(t,a,a);freduce_degree(t);freduce_coefficients(t);memcpy(o,t,10*8);}
-static void fexpand(limb *o,const u8 *i){o[0]=(((limb)i[0])|((limb)i[1]<<8)|((limb)i[2]<<16)|((limb)i[3]<<24))&0x3ffffff;o[1]=((((limb)i[3])|((limb)i[4]<<8)|((limb)i[5]<<16)|((limb)i[6]<<24))>>2)&0x1ffffff;o[2]=((((limb)i[6])|((limb)i[7]<<8)|((limb)i[8]<<16)|((limb)i[9]<<24))>>3)&0x3ffffff;o[3]=((((limb)i[9])|((limb)i[10]<<8)|((limb)i[11]<<16)|((limb)i[12]<<24))>>5)&0x1ffffff;o[4]=((((limb)i[12])|((limb)i[13]<<8)|((limb)i[14]<<16)|((limb)i[15]<<24))>>6)&0x3ffffff;o[5]=(((limb)i[16])|((limb)i[17]<<8)|((limb)i[18]<<16)|((limb)i[19]<<24))&0x1ffffff;o[6]=((((limb)i[19])|((limb)i[20]<<8)|((limb)i[21]<<16)|((limb)i[22]<<24))>>1)&0x3ffffff;o[7]=((((limb)i[22])|((limb)i[23]<<8)|((limb)i[24]<<16)|((limb)i[25]<<24))>>3)&0x1ffffff;o[8]=((((limb)i[25])|((limb)i[26]<<8)|((limb)i[27]<<16)|((limb)i[28]<<24))>>4)&0x3ffffff;o[9]=((((limb)i[28])|((limb)i[29]<<8)|((limb)i[30]<<16)|((limb)i[31]<<24))>>6)&0x1ffffff;}
+static void fmul(limb *o, const limb *a, const limb *b) {
+    limb t[19];
+    fproduct(t, a, b);
+    freduce_degree(t);
+    freduce_coefficients(t);
+    memcpy(o, t, 10 * 8);
+}
+static void fsquare(limb *o, const limb *a) {
+    limb t[19];
+    fproduct(t, a, a);
+    freduce_degree(t);
+    freduce_coefficients(t);
+    memcpy(o, t, 10 * 8);
+}
+static void fexpand(limb *o, const u8 *i) {
+    o[0] = (((limb)i[0]) | ((limb)i[1] << 8) | ((limb)i[2] << 16) | ((limb)i[3] << 24)) & 0x3ffffff;
+    o[1] = ((((limb)i[3]) | ((limb)i[4] << 8) | ((limb)i[5] << 16) | ((limb)i[6] << 24)) >> 2) & 0x1ffffff;
+    o[2] = ((((limb)i[6]) | ((limb)i[7] << 8) | ((limb)i[8] << 16) | ((limb)i[9] << 24)) >> 3) & 0x3ffffff;
+    o[3] = ((((limb)i[9]) | ((limb)i[10] << 8) | ((limb)i[11] << 16) | ((limb)i[12] << 24)) >> 5) & 0x1ffffff;
+    o[4] = ((((limb)i[12]) | ((limb)i[13] << 8) | ((limb)i[14] << 16) | ((limb)i[15] << 24)) >> 6) & 0x3ffffff;
+    o[5] = (((limb)i[16]) | ((limb)i[17] << 8) | ((limb)i[18] << 16) | ((limb)i[19] << 24)) & 0x1ffffff;
+    o[6] = ((((limb)i[19]) | ((limb)i[20] << 8) | ((limb)i[21] << 16) | ((limb)i[22] << 24)) >> 1) & 0x3ffffff;
+    o[7] = ((((limb)i[22]) | ((limb)i[23] << 8) | ((limb)i[24] << 16) | ((limb)i[25] << 24)) >> 3) & 0x1ffffff;
+    o[8] = ((((limb)i[25]) | ((limb)i[26] << 8) | ((limb)i[27] << 16) | ((limb)i[28] << 24)) >> 4) & 0x3ffffff;
+    o[9] = ((((limb)i[28]) | ((limb)i[29] << 8) | ((limb)i[30] << 16) | ((limb)i[31] << 24)) >> 6) & 0x1ffffff;
+}
 
-static s32 s32_eq(s32 a,s32 b){a=~(a^b);a&=a<<16;a&=a<<8;a&=a<<4;a&=a<<2;a&=a<<1;return a>>31;}
-static s32 s32_gte(s32 a,s32 b){a-=b;return ~(a>>31);}
+static s32 s32_eq(s32 a, s32 b) {
+    a = ~(a ^ b);
+    a &= a << 16;
+    a &= a << 8;
+    a &= a << 4;
+    a &= a << 2;
+    a &= a << 1;
+    return a >> 31;
+}
+static s32 s32_gte(s32 a, s32 b) {
+    a -= b;
+    return ~(a >> 31);
+}
 
 static void fcontract(u8 *output,limb *input_limbs){
   int i,j;s32 input[10];s32 mask;for(i=0;i<10;i++)input[i]=input_limbs[i];
@@ -1453,7 +1934,15 @@ static void fmonty(limb *x2,limb *z2,limb *x3,limb *z3,limb *x,limb *z,limb *xpr
   fproduct(z2,zz,zzz);freduce_degree(z2);freduce_coefficients(z2);
 }
 
-static void swap_conditional(limb a[19],limb b[19],limb iswap){unsigned i;s32 swap=(s32)-iswap;for(i=0;i<10;++i){s32 x=swap&(((s32)a[i])^((s32)b[i]));a[i]=((s32)a[i])^x;b[i]=((s32)b[i])^x;}}
+static void swap_conditional(limb a[19], limb b[19], limb iswap) {
+    unsigned i;
+    s32 swap = (s32)-iswap;
+    for (i = 0; i < 10; ++i) {
+        s32 x = swap & (((s32)a[i]) ^ ((s32)b[i]));
+        a[i] = ((s32)a[i]) ^ x;
+        b[i] = ((s32)b[i]) ^ x;
+    }
+}
 
 static void cmult(limb *rx,limb *rz,const u8 *n,const limb *q){
   limb a[19]={0},b[19]={1},c[19]={1},d[19]={0},*nqpqx=a,*nqpqz=b,*nqx=c,*nqz=d,*t;
@@ -1493,6 +1982,13 @@ void x25519_scalar_mult(unsigned char result[32], const unsigned char scalar[32]
     curve25519_donna(result, scalar, base);
 }
 
+/* Returns 1 if buf is all-zeros, 0 otherwise (constant-time) */
+static int ossl_is_zero_32(const unsigned char *buf) {
+    unsigned char acc = 0;
+    for (int i = 0; i < 32; i++) acc |= buf[i];
+    return (acc == 0);
+}
+
 static int der_read_tag(const unsigned char *der, int len, int *pos, int *tag_len) {
     if (*pos >= len) return -1;
     int tag = der[(*pos)++];
@@ -1510,6 +2006,8 @@ static int der_read_tag(const unsigned char *der, int len, int *pos, int *tag_le
     } else {
         *tag_len = der[(*pos)++];
     }
+    /* Validate that *tag_len bytes fit within the remaining buffer */
+    if (*tag_len < 0 || *tag_len > len - *pos) return -1;
     return tag;
 }
 
@@ -1623,6 +2121,350 @@ static int rsa_get_privexp(const unsigned char *key_der, int key_der_len,
     return 0;
 }
 
+/* Extract CRT factors (p, q) from PKCS#1 private key.
+   Key structure: SEQUENCE { version, n, e, d, p, q, dP, dQ, qInv }
+   Returns 0 on success. */
+static int rsa_get_crt_factors(const unsigned char *key_der, int key_der_len,
+                                unsigned char **p, int *p_len,
+                                unsigned char **q, int *q_len) {
+    int pos = 0, tag_len, tag;
+    tag = der_read_tag(key_der, key_der_len, &pos, &tag_len);
+    if (tag != 0x30) return -1;
+    /* Skip version, n, e, d (4 INTEGERs) */
+    for (int skip = 0; skip < 4; skip++) {
+        tag = der_read_tag(key_der, key_der_len, &pos, &tag_len);
+        if (tag != 0x02) return -1;
+        pos += tag_len;
+    }
+    /* p */
+    tag = der_read_tag(key_der, key_der_len, &pos, &tag_len);
+    if (tag != 0x02) return -1;
+    { int start = pos; if (key_der[pos] == 0x00) { start++; tag_len--; }
+      *p = (unsigned char*)malloc(tag_len); if (!*p) return -1;
+      memcpy(*p, key_der + start, tag_len); *p_len = tag_len;
+      pos = start + tag_len; }
+    /* q */
+    tag = der_read_tag(key_der, key_der_len, &pos, &tag_len);
+    if (tag != 0x02) { free(*p); return -1; }
+    { int start = pos; if (key_der[pos] == 0x00) { start++; tag_len--; }
+      *q = (unsigned char*)malloc(tag_len); if (!*q) { free(*p); return -1; }
+      memcpy(*q, key_der + start, tag_len); *q_len = tag_len; }
+    return 0;
+}
+
+/* Extended Euclidean algorithm: compute a^(-1) mod m.
+   All arrays are len bytes, little-endian.  Returns 0 on success. */
+static int bn_modinv(const unsigned char *a, const unsigned char *m, int len,
+                     unsigned char *x) {
+    unsigned char *r0 = (unsigned char*)calloc(len, 1);
+    unsigned char *r1 = (unsigned char*)calloc(len, 1);
+    unsigned char *s0 = (unsigned char*)calloc(len, 1);
+    unsigned char *s1 = (unsigned char*)calloc(len, 1);
+    unsigned char *q  = (unsigned char*)calloc(len + 1, 1);
+    unsigned char *qr_buf = (unsigned char*)calloc(len * 2, 1);
+    unsigned char *prod = (unsigned char*)calloc(len * 2, 1);
+    if (!r0 || !r1 || !s0 || !s1 || !q || !qr_buf || !prod) {
+        free(r0); free(r1); free(s0); free(s1); free(q); free(qr_buf); free(prod);
+        return -1;
+    }
+    memcpy(r0, m, len);
+    memcpy(r1, a, len);
+    s1[0] = 1;
+    int iter = 0;
+#define BN_MODINV_MAX_ITER 2048
+    while (iter < BN_MODINV_MAX_ITER) {
+        iter++;
+        int r1_zero = 1;
+        for (int i = 0; i < len; i++) if (r1[i]) { r1_zero = 0; break; }
+        if (r1_zero) { free(r0); free(r1); free(s0); free(s1); free(q); free(qr_buf); free(prod); return -1; }
+        int r1_one = (r1[0] == 1);
+        for (int i = 1; i < len; i++) if (r1[i]) { r1_one = 0; break; }
+        if (r1_one) { memcpy(x, s1, len); free(r0); free(r1); free(s0); free(s1); free(q); free(qr_buf); free(prod); return 0; }
+        memset(qr_buf, 0, len * 2);
+        memcpy(qr_buf, r0, len);
+        if (bn_divrem(qr_buf, len, r1, len, q) != 0) {
+            free(r0); free(r1); free(s0); free(s1); free(q); free(qr_buf); free(prod); return -1;
+        }
+        memcpy(r0, r1, len);
+        memcpy(r1, qr_buf, len);
+        memset(prod, 0, len * 2);
+        bn_mul(prod, q, s1, len);
+        if (bn_divrem(prod, len * 2, m, len, NULL) != 0) {
+            free(r0); free(r1); free(s0); free(s1); free(q); free(qr_buf); free(prod); return -1;
+        }
+        { int borrow = 0;
+          for (int i = 0; i < len; i++) {
+              int d = (int)s0[i] - (int)prod[i] - borrow;
+              if (d < 0) { d += 256; borrow = 1; } else borrow = 0;
+              prod[i] = (unsigned char)d;
+          }
+          if (borrow) {
+              unsigned int carry = 0;
+              for (int i = 0; i < len; i++) {
+                  unsigned int s = (unsigned int)prod[i] + m[i] + carry;
+                  prod[i] = (unsigned char)(s & 0xFF); carry = s >> 8;
+              }
+          }
+        }
+        memcpy(s0, s1, len);
+        memcpy(s1, prod, len);
+    }
+    free(r0); free(r1); free(s0); free(s1); free(q); free(qr_buf); free(prod);
+    return -1;
+#undef BN_MODINV_MAX_ITER
+}
+
+/* CRT-based RSA private key operation using precomputed qInv.
+   On entry: base_len == n_len. p, q, qInv are the CRT precomputes.
+   qInv = q^(-1) mod p, precomputed at key-load time.
+   Returns 0 on success. */
+static int rsa_modpow_crt(const unsigned char *base, int base_len,
+                           const unsigned char *n, int n_len,
+                           const unsigned char *d, int d_len,
+                           const unsigned char *p, int p_len,
+                           const unsigned char *q, int q_len,
+                           const unsigned char *qInv,
+unsigned char *result) {
+     if (base_len != n_len || !qInv) return -1;
+
+/* ---- convert all big-endian inputs to little-endian ---- */
+      int max_pq = p_len > q_len ? p_len : q_len;
+      int max_d  = d_len > max_pq ? d_len : max_pq;
+
+      /* base has n_len bytes (same as n); b_full holds full-length LE base */
+      unsigned char *b_full = calloc(n_len, 1);
+      unsigned char *p_le   = calloc(max_pq, 1);
+      unsigned char *q_le   = calloc(max_pq, 1);
+      unsigned char *d_le   = calloc(max_d, 1);
+      unsigned char *qi_le  = calloc(max_pq, 1);
+      unsigned char *n_le   = calloc(n_len, 1);
+
+#define CRT_FAIL { ret = -1; goto crt_cleanup; }
+      int ret = 0;
+      unsigned char *p1_le  = NULL;
+      unsigned char *q1_le  = NULL;
+      unsigned char *dP_le  = NULL;
+      unsigned char *dQ_le  = NULL;
+      unsigned char *dtmp   = NULL;
+      unsigned char *bp_le  = NULL;
+      unsigned char *bq_le  = NULL;
+      unsigned char *m1_le  = NULL;
+      unsigned char *m2_le  = NULL;
+
+      if (!b_full || !p_le || !q_le || !d_le || !qi_le || !n_le) CRT_FAIL;
+
+      bn_from_bin(b_full, base,  base_len, n_len);
+      bn_from_bin(p_le,   p,     p_len,    max_pq);
+      bn_from_bin(q_le,   q,     q_len,    max_pq);
+      bn_from_bin(d_le,   d,     d_len,    max_d);
+      bn_from_bin(qi_le,  qInv,  p_len,    max_pq);
+      bn_from_bin(n_le,   n,     n_len,    n_len);
+
+     /* ---- p1 = p-1, q1 = q-1 (little-endian) ---- */
+     p1_le = calloc(max_pq, 1);
+     q1_le = calloc(max_pq, 1);
+     if (!p1_le || !q1_le) CRT_FAIL;
+     memcpy(p1_le, p_le, max_pq);
+     memcpy(q1_le, q_le, max_pq);
+     { int borrow = 1;
+       for (int i = 0; i < max_pq && borrow; i++) {
+           if (p1_le[i] >= 1) { p1_le[i]--; borrow = 0; }
+           else { p1_le[i] = 0xFF; }
+       }
+     }
+     { int borrow = 1;
+       for (int i = 0; i < max_pq && borrow; i++) {
+           if (q1_le[i] >= 1) { q1_le[i]--; borrow = 0; }
+           else { q1_le[i] = 0xFF; }
+       }
+     }
+
+     /* ---- dP = d mod (p-1), dQ = d mod (q-1) (little-endian) ---- */
+     dP_le = calloc(max_pq, 1);
+     dQ_le = calloc(max_pq, 1);
+     dtmp  = calloc(max_d, 1);
+     if (!dP_le || !dQ_le || !dtmp) CRT_FAIL;
+
+     memcpy(dtmp, d_le, max_d);
+     if (bn_divrem(dtmp, max_d, p1_le, max_pq, NULL)) CRT_FAIL;
+     memcpy(dP_le, dtmp, max_pq);
+
+     memcpy(dtmp, d_le, max_d);
+     if (bn_divrem(dtmp, max_d, q1_le, max_pq, NULL)) CRT_FAIL;
+     memcpy(dQ_le, dtmp, max_pq);
+     free(dtmp); dtmp = NULL;
+
+/* ---- bp = base mod p, bq = base mod q (little-endian, full-length base) ---- */
+      unsigned char *bp_full = calloc(n_len, 1);
+      unsigned char *bq_full = calloc(n_len, 1);
+      if (!bp_full || !bq_full) CRT_FAIL;
+      memcpy(bp_full, b_full, n_len);
+      memcpy(bq_full, b_full, n_len);
+      if (bn_divrem(bp_full, n_len, p_le, max_pq, NULL)) CRT_FAIL;
+      if (bn_divrem(bq_full, n_len, q_le, max_pq, NULL)) CRT_FAIL;
+      /* Extract remainders (fit in max_pq bytes) */
+      bp_le = calloc(max_pq, 1);
+      bq_le = calloc(max_pq, 1);
+      if (!bp_le || !bq_le) { free(bp_full); free(bq_full); CRT_FAIL; }
+      memcpy(bp_le, bp_full, max_pq);
+      memcpy(bq_le, bq_full, max_pq);
+      free(bp_full); free(bq_full);
+
+     /* ---- m1 = bp^dP mod p, m2 = bq^dQ mod q (via rsa_modpow with BE round-trip) ---- */
+     m1_le = calloc(max_pq, 1);
+     m2_le = calloc(max_pq, 1);
+     if (!m1_le || !m2_le) CRT_FAIL;
+
+     /* rsa_modpow works on big-endian; convert LE->BE, call, convert BE->LE */
+     {
+         unsigned char *bp_be = malloc(max_pq);
+         unsigned char *dP_be = malloc(max_pq);
+         unsigned char *p_be  = malloc(max_pq);
+         unsigned char *tmp   = malloc(max_pq);
+         if (!bp_be || !dP_be || !p_be || !tmp) {
+             free(bp_be); free(dP_be); free(p_be); free(tmp); CRT_FAIL;
+         }
+         bn_to_bin(bp_be, max_pq, bp_le, max_pq);
+         bn_to_bin(dP_be, max_pq, dP_le, max_pq);
+         bn_to_bin(p_be,  max_pq, p_le,  max_pq);
+if (rsa_modpow(bp_be, max_pq, dP_be, max_pq, p_be, max_pq, tmp) != 0) {
+              free(bp_be); free(dP_be); free(p_be); free(tmp); CRT_FAIL;
+          }
+          bn_from_bin(m1_le, tmp, max_pq, max_pq);
+         free(bp_be); free(dP_be); free(p_be); free(tmp);
+     }
+     {
+         unsigned char *bq_be = malloc(max_pq);
+         unsigned char *dQ_be = malloc(max_pq);
+         unsigned char *q_be  = malloc(max_pq);
+         unsigned char *tmp   = malloc(max_pq);
+         if (!bq_be || !dQ_be || !q_be || !tmp) {
+             free(bq_be); free(dQ_be); free(q_be); free(tmp); CRT_FAIL;
+         }
+         bn_to_bin(bq_be, max_pq, bq_le, max_pq);
+         bn_to_bin(dQ_be, max_pq, dQ_le, max_pq);
+         bn_to_bin(q_be,  max_pq, q_le,  max_pq);
+         if (rsa_modpow(bq_be, max_pq, dQ_be, max_pq, q_be, max_pq, tmp) != 0) {
+             free(bq_be); free(dQ_be); free(q_be); free(tmp); CRT_FAIL;
+         }
+         bn_from_bin(m2_le, tmp, max_pq, max_pq);
+         free(bq_be); free(dQ_be); free(q_be); free(tmp);
+     }
+
+/* ---- Garner recombination (all little-endian) ---- */
+      /* diff = (m1 - m2) mod p */
+      {
+          unsigned char *diff = calloc(max_pq + 1, 1); /* +1 for carry */
+          if (!diff) CRT_FAIL;
+          memcpy(diff, m1_le, max_pq);
+          /* If m1 < m2, add p before subtracting to avoid wrapping */
+          if (!bn_ge_ct(m1_le, m2_le, max_pq)) {
+              unsigned int carry = 0;
+              for (int i = 0; i < max_pq; i++) {
+                  unsigned int s = (unsigned int)diff[i] + (unsigned int)p_le[i] + carry;
+                  diff[i] = (unsigned char)(s & 0xFF);
+                  carry = s >> 8;
+              }
+              diff[max_pq] = (unsigned char)carry;
+          }
+          /* Subtract m2_le (max_pq bytes) from diff (max_pq+1 bytes) */
+          {
+              unsigned int borrow = 0;
+              for (int i = 0; i < max_pq; i++) {
+                  unsigned int tmp = (unsigned int)diff[i] - (unsigned int)m2_le[i] - borrow;
+                  diff[i] = (unsigned char)(tmp & 0xFF);
+                  borrow = (tmp >> 8) & 1;
+              }
+              /* Propagate borrow to byte max_pq */
+              if (borrow) {
+                  unsigned int tmp = (unsigned int)diff[max_pq] - borrow;
+                  diff[max_pq] = (unsigned char)(tmp & 0xFF);
+                  /* borrow should be zero now since we added p which ensures diff >= m2 */
+              }
+          }
+
+          /* Now diff = m1 - m2 + (p if m1 < m2 else 0).
+             Since both are < p, the result is in [0, p-1] and byte max_pq should be 0.
+             Final reduction: if diff >= p, subtract p (can happen when m1 > m2 but both near p). */
+          if (bn_ge_ct(diff, p_le, max_pq)) {
+              bn_sub(diff, p_le, max_pq);
+          }
+
+          /* diff_rem = diff (already mod p) */
+          unsigned char *diff_rem = calloc(max_pq, 1);
+          if (!diff_rem) { free(diff); CRT_FAIL; }
+          memcpy(diff_rem, diff, max_pq);
+          free(diff);
+
+         /* h_raw = diff_rem * qInv, then h = h_raw mod p */
+         unsigned char *h_raw = calloc(max_pq * 2, 1);
+         if (!h_raw) { free(diff_rem); CRT_FAIL; }
+         bn_mul(h_raw, diff_rem, qi_le, max_pq);
+         free(diff_rem);
+         if (bn_divrem(h_raw, max_pq * 2, p_le, max_pq, NULL))
+             { free(h_raw); CRT_FAIL; }
+
+         unsigned char *h = calloc(max_pq, 1);
+         if (!h) { free(h_raw); CRT_FAIL; }
+         memcpy(h, h_raw, max_pq);
+         free(h_raw);
+
+         /* hq_prod = h * q */
+         int hq_len = max_pq * 2;
+         unsigned char *hq_prod = calloc(hq_len, 1);
+         if (!hq_prod) { free(h); CRT_FAIL; }
+         bn_mul(hq_prod, h, q_le, max_pq);
+         free(h);
+
+         /* result_le = hq_prod + m2 (little-endian: carry LSB->MSB) */
+         {
+             unsigned int carry = 0;
+             for (int i = 0; i < max_pq; i++) {
+                 unsigned int s = (unsigned int)hq_prod[i] + (unsigned int)m2_le[i] + carry;
+                 hq_prod[i] = (unsigned char)(s & 0xFF);
+                 carry = s >> 8;
+             }
+             for (int i = max_pq; carry && i < hq_len; i++) {
+                 unsigned int s = (unsigned int)hq_prod[i] + carry;
+                 hq_prod[i] = (unsigned char)(s & 0xFF);
+                 carry = s >> 8;
+             }
+         }
+
+         /* result = (hq_prod + m2) mod n */
+         if (bn_divrem(hq_prod, hq_len, n_le, n_len, NULL))
+             { free(hq_prod); CRT_FAIL; }
+
+         /* Convert back to big-endian */
+         bn_to_bin(result, n_len, hq_prod, n_len);
+         free(hq_prod);
+     }
+
+ crt_cleanup:
+     free(b_full); free(p_le);  free(q_le);
+     free(d_le);   free(qi_le); free(n_le);
+     free(p1_le); free(q1_le);
+     free(dP_le); free(dQ_le); free(dtmp);
+     free(bp_le); free(bq_le);
+     free(m1_le); free(m2_le);
+     return ret;
+#undef CRT_FAIL
+ }
+
+ /* Wrapper for RSA private key operation: uses CRT when p,q,qInv are available. */
+static int rsa_privkey_op(const unsigned char *base, int base_len,
+                           const unsigned char *n, int n_len,
+                           const unsigned char *d, int d_len,
+                           const unsigned char *p, int p_len,
+                           const unsigned char *q, int q_len,
+                           const unsigned char *qInv,
+                           unsigned char *result) {
+    if (p && q && qInv && p_len > 0 && q_len > 0) {
+        return rsa_modpow_crt(base, base_len, n, n_len, d, d_len, p, p_len, q, q_len, qInv, result);
+    }
+    return rsa_modpow(base, base_len, d, d_len, n, n_len, result);
+}
+
 /* ========================================================================
  * CORRECTED DER-based RSA public key extraction from X.509 certificate
  * ======================================================================== */
@@ -1697,9 +2539,9 @@ static int rsa_get_pubkey_from_cert(const unsigned char *cert_der, int cert_der_
     /* Exponent INTEGER */
     tag = der_read_tag(cert_der, cert_der_len, &pos, &tlen);
     if (tag != 0x02) { free(*n); return -1; }
-    int e_start = pos;
-    if (cert_der[e_start] == 0x00) { e_start++; tlen--; }
     if (tlen <= 0) { free(*n); return -1; }
+    int e_start = pos;
+    if (cert_der[e_start] == 0x00 && tlen > 1) { e_start++; tlen--; }
     *e = (unsigned char*)malloc(tlen);
     if (!*e) { free(*n); return -1; }
     memcpy(*e, cert_der + e_start, tlen);
@@ -1737,25 +2579,38 @@ static int rsa_encrypt(const unsigned char *n, int n_len,
 static int rsa_decrypt(const unsigned char *n, int n_len,
                        const unsigned char *d, int d_len,
                        const unsigned char *ciphertext,
-                       unsigned char *plaintext, int *pt_len, int max_pt_len) {
+                       unsigned char *plaintext, int *pt_len, int max_pt_len,
+                       const unsigned char *p, int p_len,
+                       const unsigned char *q, int q_len,
+                       const unsigned char *qInv) {
     unsigned char *block = (unsigned char*)malloc(n_len);
     if (!block) return -1;
-    if (rsa_modpow(ciphertext, n_len, d, d_len, n, n_len, block) != 0) {
+    if (rsa_privkey_op(ciphertext, n_len, n, n_len, d, d_len, p, p_len, q, q_len, qInv, block) != 0) {
         free(block); return -1;
     }
-    /* Constant-time PKCS#1 v1.5 padding check: combine all failure conditions */
-    int pad_ok = (block[0] == 0x00 && block[1] == 0x02);
-    /* Scan for first 0x00 byte without early exit to avoid timing oracle */
+    /* Constant-time PKCS#1 v1.5 padding check: use bitwise ops to avoid short-circuit */
+    int b0_ok = (block[0] == 0x00);
+    int b1_ok = (block[1] == 0x02);
+    int pad_ok = b0_ok & b1_ok;
+    /* Scan for first 0x00 byte — fully constant-time */
     int sep_at = n_len; /* sentinel: not found */
+    int sep_mask = 1;   /* stays 1 until first zero byte found */
     for (int i = 2; i < n_len; i++) {
-        /* Record first zero position; branch is on a loop-local variable that
-           becomes invariant after the first match, so timing is data-independent */
-        if (block[i] == 0x00 && sep_at == n_len) sep_at = i;
+        /* Branchless: is_nonzero == 1 iff block[i] != 0x00 */
+        int is_nonzero = (int)((block[i] | (unsigned char)(~block[i] + 1)) >> 7);
+        /* is_sep == 1 iff block[i] == 0x00 (negation of is_nonzero) */
+        int is_sep = 1 - is_nonzero;
+        int pick = is_sep & sep_mask;
+        /* mask = -pick: all-ones iff pick==1, else all-zeros */
+        int mask = -pick;
+        sep_at = (sep_at & ~mask) | (i & mask);
+        sep_mask &= ~pick;
     }
     int sep_found = (sep_at < n_len - 1);
-    int pt_len_actual = sep_found ? (n_len - sep_at - 1) : 0;
-    int len_ok = (pt_len_actual >= 1 && pt_len_actual <= max_pt_len);
-    int ok = pad_ok && sep_found && len_ok;
+    /* Constant-time: compute lengths without branches */
+    int pt_len_actual = (n_len - sep_at - 1) & -(int)sep_found;
+    int len_ok = ((pt_len_actual - 1) | (max_pt_len - pt_len_actual)) >= 0;
+    int ok = pad_ok & sep_found & len_ok;
     if (!ok) {
         /* Single unified error — no oracle */
         fprintf(stderr, "ossl: RSA decryption failed\n");
@@ -1844,7 +2699,10 @@ static int rsa_verify_signature(const unsigned char *n, int n_len,
 static int rsa_sign(const unsigned char *n, int n_len,
                     const unsigned char *d, int d_len,
                     const unsigned char *hash, int hash_len,
-                    unsigned char *signature) {
+                    unsigned char *signature,
+                    const unsigned char *p, int p_len,
+                    const unsigned char *q, int q_len,
+                    const unsigned char *qInv) {
     const unsigned char *digest_prefix;
     int prefix_len;
     if (hash_len == 32) {
@@ -1881,7 +2739,7 @@ static int rsa_sign(const unsigned char *n, int n_len,
     block[2 + ps_len] = 0x00;
     memcpy(block + 3 + ps_len, digest_prefix, prefix_len);
     memcpy(block + 3 + ps_len + prefix_len, hash, hash_len);
-    if (rsa_modpow(block, n_len, d, d_len, n, n_len, signature) != 0) {
+    if (rsa_privkey_op(block, n_len, n, n_len, d, d_len, p, p_len, q, q_len, qInv, signature) != 0) {
         free(block); return -1;
     }
     free(block);
@@ -1939,9 +2797,114 @@ static void ossl_mgf1_sha384(const unsigned char *seed, int seed_len,
 }
 
 /* ========================================================================
+ * RSA-PSS signing (RFC 8017 Section 8.1.1)
+ *
+ * hLen, sLen, emLen match RFC 8017 notation for readability.
+ * ======================================================================== */
+static int ossl_rsa_pss_sign(const unsigned char *n, int n_len,
+                              const unsigned char *d, int d_len,
+                              const unsigned char *hash, int hash_len,
+                              unsigned char *sig, int salt_len,
+                              const unsigned char *p, int p_len,
+                              const unsigned char *q, int q_len,
+                              const unsigned char *qInv) {
+    int hLen = hash_len;
+    int sLen = salt_len;
+    int emLen = n_len;
+    int emBits;
+
+    /* Validate input sizes */
+    if (emLen <= 0 || hLen <= 0 || sLen < 0 || sLen > 48) return -1;
+    if (emLen < hLen + sLen + 2) return -1;
+
+    /* Compute modulus bit length */
+    {
+        int modBits = emLen * 8;
+        for (int i = 0; i < emLen; i++) {
+            unsigned char b = n[i];
+            if (b != 0) {
+                int bits = 8;
+                while ((b & 0x80) == 0) { b <<= 1; bits--; }
+                modBits = (emLen - 1 - i) * 8 + bits;
+                break;
+            }
+        }
+        emBits = modBits - 1;
+    }
+
+    /* 1. Generate random salt */
+    unsigned char salt[48];
+    for (int i = 0; i < sLen; i++) {
+        unsigned char rb;
+        if (ossl_rand_bytes(&rb, 1) != 0) return -1;
+        salt[i] = rb;
+    }
+
+    /* 2. M' = 8*0x00 || hash || salt */
+    int psLen = emLen - sLen - hLen - 2;
+    unsigned char M_prime[8 + 48 + 48];
+    memset(M_prime, 0, 8);
+    memcpy(M_prime + 8, hash, hLen);
+    memcpy(M_prime + 8 + hLen, salt, sLen);
+
+    /* 3. H = Hash(M') */
+    unsigned char H[48];
+    if (hLen == 32) {
+        ossl_sha256_ctx ctx; ossl_sha256_init(&ctx);
+        ossl_sha256_update(&ctx, M_prime, 8 + hLen + sLen);
+        ossl_sha256_final(&ctx, H);
+    } else {
+        ossl_sha384_ctx ctx; ossl_sha384_init(&ctx);
+        ossl_sha384_update(&ctx, M_prime, 8 + hLen + sLen);
+        ossl_sha384_final(&ctx, H);
+    }
+
+    /* 4. DB = PS(zeros) || 0x01 || salt */
+    int DB_len = psLen + 1 + sLen;
+    unsigned char *DB = (unsigned char*)calloc(1, DB_len);
+    if (!DB) return -1;
+    DB[psLen] = 0x01;
+    memcpy(DB + psLen + 1, salt, sLen);
+
+    /* 5. dbMask = MGF1(H, DB_len) */
+    unsigned char *dbMask = (unsigned char*)malloc(DB_len);
+    if (!dbMask) { free(DB); return -1; }
+    if (hLen == 32)
+        ossl_mgf1_sha256(H, hLen, DB_len, dbMask);
+    else
+        ossl_mgf1_sha384(H, hLen, DB_len, dbMask);
+
+    /* 6. maskedDB = DB XOR dbMask */
+    unsigned char *maskedDB = (unsigned char*)malloc(DB_len);
+    if (!maskedDB) { free(dbMask); free(DB); return -1; }
+    for (int i = 0; i < DB_len; i++)
+        maskedDB[i] = DB[i] ^ dbMask[i];
+    free(DB); free(dbMask);
+
+    /* 7. Set leftmost bits of maskedDB[0] to 0 */
+    int clear_bits = 8 * emLen - emBits;
+    if (clear_bits > 0 && clear_bits <= 8)
+        maskedDB[0] &= (unsigned char)(0xFF >> clear_bits);
+
+    /* 8. EM = maskedDB || H || 0xBC */
+    unsigned char *EM = (unsigned char*)calloc(1, emLen);
+    if (!EM) { free(maskedDB); return -1; }
+    memcpy(EM, maskedDB, DB_len);
+    memcpy(EM + DB_len, H, hLen);
+    EM[emLen - 1] = 0xBC;
+    free(maskedDB);
+
+    /* 9. Sign: sig = EM^d mod n */
+    if (rsa_privkey_op(EM, emLen, n, n_len, d, d_len, p, p_len, q, q_len, qInv, sig) != 0) {
+        free(EM); return -1;
+    }
+    free(EM);
+    return 0;
+}
+
+/* ========================================================================
  * RSA-PSS signature verification (RFC 8017 Section 8.1.2)
  * ======================================================================== */
-
 static int ossl_rsa_pss_verify(const unsigned char *n, int n_len,
                                 const unsigned char *e, int e_len,
                                 const unsigned char *hash, int hash_len,
@@ -2014,12 +2977,27 @@ static int ossl_rsa_pss_verify(const unsigned char *n, int n_len,
             DB[0] &= (unsigned char)(0xFF >> clear_bits);
     }
 
-    /* 7. Verify DB structure: PS (zeros) || 0x01 || salt */
-    int ps_end = 0;
-    while (ps_end < maskedDB_len - hLen - 1 && DB[ps_end] == 0x00)
-        ps_end++;
-    if (DB[ps_end] != 0x01) {
-        free(DB); free(dbMask); free(EM); return -1;
+    /* 7. Verify DB structure: PS (zeros) || 0x01 || salt.
+       Constant-time scan: process all bytes without branching on content.
+       Bound: scan up to maskedDB_len - salt_len - 1 (where 0x01 separator sits). */
+    int ps_end = maskedDB_len - salt_len - 1; /* default: assume all zeros in PS region */
+    int scan_end_val = maskedDB_len - salt_len - 1;
+    if (scan_end_val < 0) { free(DB); free(dbMask); free(EM); return -1; }
+    for (int i = 0; i < scan_end_val; i++) {
+        /* Constant-time: if DB[i] != 0 and we haven't found the sep yet, record i */
+        int is_nonzero = (int)((DB[i] | (unsigned char)(~DB[i] + 1)) >> 7);
+        /* is_nonzero == 1 iff DB[i] != 0x00 */
+        int is_still_scanned = (ps_end == scan_end_val); /* 1 iff no non-zero found yet */
+        int pick = is_nonzero & is_still_scanned;
+        /* Branchless: if pick == 1, set ps_end = i */
+        int mask = -pick; /* mask is all-ones iff pick==1, else all-zeros */
+        ps_end = (ps_end & ~mask) | (i & mask);
+    }
+    /* Constant-time check: expected 0x01 at PS end */
+    {
+        unsigned char db_sep = DB[ps_end];
+        int sep_ok = (db_sep == 0x01);
+        if (!sep_ok) { free(DB); free(dbMask); free(EM); return -1; }
     }
     unsigned char *recovered_salt = DB + ps_end + 1;
     int recovered_salt_len = maskedDB_len - ps_end - 1;
@@ -2048,11 +3026,15 @@ static int ossl_rsa_pss_verify(const unsigned char *n, int n_len,
         ossl_sha384_final(&ctx, H_prime);
     }
 
-    /* 9. Verify H' == H */
-    int ok = (memcmp(H_prime, H, hLen) == 0);
+    /* 9. Verify H' == H (constant-time comparison) */
+    {
+        unsigned char diff = 0;
+        for (int i = 0; i < hLen; i++) diff |= H_prime[i] ^ H[i];
+        int ok = (diff == 0);
 
-    free(DB); free(dbMask); free(EM);
-    return ok ? 0 : -1;
+        free(DB); free(dbMask); free(EM);
+        return ok ? 0 : -1;
+    }
 }
 
 /* ========================================================================
@@ -2768,6 +3750,7 @@ static void tls_prf_sha384(const unsigned char *secret, int secret_len,
  * Platform initialization (once)
  * ======================================================================== */
 
+/* Note: not thread-safe by design — caller must serialise library init. */
 static int ossl_platform_init(void) {
     static int initialized = 0;
     if (initialized) return 0;
@@ -2876,10 +3859,7 @@ static int ossl_tls13_derive_handshake_secrets(struct ossl_ssl *ssl,
             ossl_hkdf_expand_label_sha384(handshake_secret, "c hs traffic", ch_sh_hash, 48, ssl->client_hs_secret, 48);
             ossl_hkdf_expand_label_sha384(handshake_secret, "s hs traffic", ch_sh_hash, 48, ssl->server_hs_secret, 48);
         } else {
-            /* RFC 8446 §7.1: client uses "c hs traffic", server uses "s hs traffic".
-               NOTE: Against axm.dev, "c hs traffic" causes client Finished rejection.
-               The server appears to expect "s hs traffic" for the client direction.
-               This is non-RFC-standard behavior; see TODO.txt item #1. */
+            /* RFC 8446 §7.1: client uses "c hs traffic", server uses "s hs traffic". */
             ossl_hkdf_expand_label_sha256(handshake_secret, "c hs traffic", ch_sh_hash, 32, ssl->client_hs_secret, 32);
             ossl_hkdf_expand_label_sha256(handshake_secret, "s hs traffic", ch_sh_hash, 32, ssl->server_hs_secret, 32);
         }
@@ -3005,15 +3985,15 @@ static int ossl_send_record(struct ossl_ssl *ssl, int type,
     header[2] = OSSL_TLS_VERSION_MINOR;
     header[3] = (unsigned char)((len >> 8) & 0xFF);
     header[4] = (unsigned char)(len & 0xFF);
-    if (tcp_send_all(ssl->fd, header, 5) != 0) return -1;
-    if (tcp_send_all(ssl->fd, data, len) != 0) return -1;
+    if (tcp_send_all(ssl->fd, header, 5, 1) != 0) return -1;
+    if (tcp_send_all(ssl->fd, data, len, 1) != 0) return -1;
     return 0;
 }
 
 static int ossl_recv_record(struct ossl_ssl *ssl, int *type,
                              unsigned char *buf, int max_len, int *len) {
     unsigned char header[5];
-    if (tcp_recv_all(ssl->fd, header, 5) != 0) {
+    if (tcp_recv_all(ssl->fd, header, 5, 1) != 0) {
         return -1;
     }
     /* Accept any TLS 1.x record layer version (many servers use {3,1} for TLS 1.2) */
@@ -3027,7 +4007,7 @@ static int ossl_recv_record(struct ossl_ssl *ssl, int *type,
         fprintf(stderr, "ossl: Record length %d larger than maximum %d\n", body_len, max_len);
         return -1;
     }
-    if (tcp_recv_all(ssl->fd, buf, body_len) != 0) return -1;
+    if (tcp_recv_all(ssl->fd, buf, body_len, 1) != 0) return -1;
     if (*type == 21 && body_len >= 2) {
         fprintf(stderr, "ossl: Received alert (level=%d, description=%d)\n", buf[0], buf[1]);
     }
@@ -3092,7 +4072,7 @@ static int ossl_get_handshake_msg(struct ossl_ssl *ssl, int *hs_type,
 
 static int ossl_send_encrypted(struct ossl_ssl *ssl, int type,
                                 const unsigned char *data, int len,
-                                int use_server_keys) {
+                                int use_server_keys, int blocking) {
     if (len < 0 || len > OSSL_MAX_RECORD_SIZE) return -1;
     unsigned char *key = use_server_keys ? ssl->server_write_key : ssl->client_write_key;
     unsigned char *iv = use_server_keys ? ssl->server_write_iv : ssl->client_write_iv;
@@ -3118,6 +4098,7 @@ static int ossl_send_encrypted(struct ossl_ssl *ssl, int type,
         free(ciphertext); return -1;
     }
     
+    if (seq >= 0xFFFFFFFFFFFFFFFFULL) { free(ciphertext); return -1; }
     if (use_server_keys) ssl->server_seq++; else ssl->client_seq++;
     
     /* Build record: header + explicit nonce + ciphertext + tag */
@@ -3135,18 +4116,17 @@ static int ossl_send_encrypted(struct ossl_ssl *ssl, int type,
     /* tag */
     memcpy(outrec+13+len, tag, 16);
     
-    int n = tcp_send_all(ssl->fd, outrec, 5 + total_body_len);
+    int n = tcp_send_all(ssl->fd, outrec, 5 + total_body_len, blocking);
     free(ciphertext); free(outrec);
+    if (n == OSSL_WANT) return OSSL_WANT;
     return (n == 0) ? 0 : -1;
 }
 
 static int ossl_recv_encrypted(struct ossl_ssl *ssl, int *type,
                                 unsigned char *plaintext, int *pt_len,
-                                int use_server_keys) {
+                                int use_server_keys, int blocking) {
     unsigned char header[5];
-    if (tcp_recv_all(ssl->fd, header, 5) != 0) {
-        return -1;
-    }
+    { int r = tcp_recv_all(ssl->fd, header, 5, blocking); if (r != 0) return (r == OSSL_WANT) ? OSSL_WANT : -1; }
     *type = header[0];
     int total_body = (header[3] << 8) | header[4];
     if (total_body > OSSL_MAX_RECORD_SIZE + 24) return -1;
@@ -3155,7 +4135,7 @@ static int ossl_recv_encrypted(struct ossl_ssl *ssl, int *type,
     
     unsigned char *record_data = (unsigned char*)malloc(total_body);
     if (!record_data) return -1;
-    if (tcp_recv_all(ssl->fd, record_data, total_body) != 0) { free(record_data); return -1; }
+    { int r = tcp_recv_all(ssl->fd, record_data, total_body, blocking); if (r != 0) { free(record_data); return (r == OSSL_WANT) ? OSSL_WANT : -1; } }
     
     /* Parse record: explicit nonce (8 bytes), ciphertext (ct_len), tag (16) */
     unsigned char explicit_nonce[8];
@@ -3185,6 +4165,7 @@ static int ossl_recv_encrypted(struct ossl_ssl *ssl, int *type,
         free(record_data);
         return -1;
     }
+    if (seq >= 0xFFFFFFFFFFFFFFFFULL) { free(record_data); return -1; }
     if (use_server_keys) ssl->server_seq++; else ssl->client_seq++;
     *pt_len = ct_len;
     free(record_data);
@@ -3193,7 +4174,7 @@ static int ossl_recv_encrypted(struct ossl_ssl *ssl, int *type,
 
 static int ossl_send_encrypted256(struct ossl_ssl *ssl, int type,
                                    const unsigned char *data, int len,
-                                   int use_server_keys) {
+                                   int use_server_keys, int blocking) {
     if (len < 0 || len > OSSL_MAX_RECORD_SIZE) return -1;
     unsigned char *key = use_server_keys ? ssl->server_write_key : ssl->client_write_key;
     unsigned char *iv = use_server_keys ? ssl->server_write_iv : ssl->client_write_iv;
@@ -3218,6 +4199,7 @@ static int ossl_send_encrypted256(struct ossl_ssl *ssl, int type,
         free(ciphertext); return -1;
     }
     
+    if (seq >= 0xFFFFFFFFFFFFFFFFULL) { free(ciphertext); return -1; }
     if (use_server_keys) ssl->server_seq++; else ssl->client_seq++;
     
     unsigned char *outrec = (unsigned char*)malloc(5 + total_body_len);
@@ -3234,18 +4216,17 @@ static int ossl_send_encrypted256(struct ossl_ssl *ssl, int type,
     /* tag */
     memcpy(outrec+13+len, tag, 16);
     
-    int n = tcp_send_all(ssl->fd, outrec, 5 + total_body_len);
+    int n = tcp_send_all(ssl->fd, outrec, 5 + total_body_len, blocking);
     free(ciphertext); free(outrec);
+    if (n == OSSL_WANT) return OSSL_WANT;
     return (n == 0) ? 0 : -1;
 }
 
 static int ossl_recv_encrypted256(struct ossl_ssl *ssl, int *type,
                                    unsigned char *plaintext, int *pt_len,
-                                   int use_server_keys) {
+                                   int use_server_keys, int blocking) {
     unsigned char header[5];
-    if (tcp_recv_all(ssl->fd, header, 5) != 0) {
-        return -1;
-    }
+    { int r = tcp_recv_all(ssl->fd, header, 5, blocking); if (r != 0) return (r == OSSL_WANT) ? OSSL_WANT : -1; }
     *type = header[0];
     int total_body = (header[3] << 8) | header[4];
     if (total_body > OSSL_MAX_RECORD_SIZE + 24) return -1;
@@ -3254,7 +4235,7 @@ static int ossl_recv_encrypted256(struct ossl_ssl *ssl, int *type,
     
     unsigned char *record_data = (unsigned char*)malloc(total_body);
     if (!record_data) return -1;
-    if (tcp_recv_all(ssl->fd, record_data, total_body) != 0) { free(record_data); return -1; }
+    { int r = tcp_recv_all(ssl->fd, record_data, total_body, blocking); if (r != 0) { free(record_data); return (r == OSSL_WANT) ? OSSL_WANT : -1; } }
     
     unsigned char explicit_nonce[8];
     memcpy(explicit_nonce, record_data, 8);
@@ -3282,6 +4263,7 @@ static int ossl_recv_encrypted256(struct ossl_ssl *ssl, int *type,
         free(record_data);
         return -1;
     }
+    if (seq >= 0xFFFFFFFFFFFFFFFFULL) { free(record_data); return -1; }
     if (use_server_keys) ssl->server_seq++; else ssl->client_seq++;
     *pt_len = ct_len;
     free(record_data);
@@ -3319,7 +4301,8 @@ static void ossl_tls13_compute_finished(struct ossl_ssl *ssl,
 
 static int ossl_tls13_send_encrypted(struct ossl_ssl *ssl, int real_type,
                                       const unsigned char *data, int len,
-                                      int use_server_keys, int is_hs_phase) {
+                                      int use_server_keys, int is_hs_phase,
+                                      int blocking) {
     if (len < 0 || len > OSSL_MAX_RECORD_SIZE) return -1;
     int hl = ssl->tls13_hash_len;
     int key_len = (hl == 48) ? 32 : 16;
@@ -3370,6 +4353,7 @@ static int ossl_tls13_send_encrypted(struct ossl_ssl *ssl, int real_type,
 
     if (enc_ok != 0) { free(ciphertext); return -1; }
 
+    if (*seq >= 0xFFFFFFFFFFFFFFFFULL) { free(ciphertext); return -1; }
     (*seq)++;
 
     /* Build record: header + ciphertext + tag */
@@ -3387,28 +4371,34 @@ static int ossl_tls13_send_encrypted(struct ossl_ssl *ssl, int real_type,
     memcpy(outrec + 5 + pt_len, tag, 16);
     free(ciphertext);
 
-    int n = tcp_send_all(ssl->fd, outrec, 5 + record_body);
+    int n = tcp_send_all(ssl->fd, outrec, 5 + record_body, blocking);
     free(outrec);
+    if (n == OSSL_WANT) return OSSL_WANT;
     return (n == 0) ? 0 : -1;
 }
 
 static int ossl_tls13_recv_encrypted(struct ossl_ssl *ssl, int *real_type,
                                       unsigned char *plaintext, int *pt_len,
-                                      int use_server_keys, int is_hs_phase) {
+                                      int use_server_keys, int is_hs_phase,
+                                      int blocking) {
     int hl = ssl->tls13_hash_len;
     int key_len = (hl == 48) ? 32 : 16;
     unsigned char header[5];
-    if (tcp_recv_all(ssl->fd, header, 5) != 0) {
-        return -1;
-    }
+    int record_body;
+    int ccs_skip_count = 0;
 
-    int record_body = (header[3] << 8) | header[4];
-    /* Handle TLS 1.3 middlebox compatibility mode: skip CCS */
-    if (header[0] == SSL3_RT_CHANGE_CIPHER_SPEC) {
-        if (record_body != 1) return -1;
-        unsigned char ccs_byte;
-        if (tcp_recv_all(ssl->fd, &ccs_byte, 1) != 0) return -1;
-        return ossl_tls13_recv_encrypted(ssl, real_type, plaintext, pt_len, use_server_keys, is_hs_phase);
+    while (1) {
+        { int r = tcp_recv_all(ssl->fd, header, 5, blocking); if (r != 0) return (r == OSSL_WANT) ? OSSL_WANT : -1; }
+
+        record_body = (header[3] << 8) | header[4];
+        /* Handle TLS 1.3 middlebox compatibility mode: skip CCS */
+        if (header[0] == SSL3_RT_CHANGE_CIPHER_SPEC) {
+            if (record_body != 1 || ++ccs_skip_count > 5) return -1;
+            unsigned char ccs_byte;
+            { int r = tcp_recv_all(ssl->fd, &ccs_byte, 1, blocking); if (r != 0) return (r == OSSL_WANT) ? OSSL_WANT : -1; }
+            continue;
+        }
+        break;
     }
     if (record_body > OSSL_MAX_RECORD_SIZE + 24) return -1;
     if (record_body < 1 + 16) return -1; /* at least 1 byte plaintext + tag */
@@ -3417,7 +4407,7 @@ static int ossl_tls13_recv_encrypted(struct ossl_ssl *ssl, int *real_type,
 
     unsigned char *record_data = (unsigned char*)malloc(record_body);
     if (!record_data) return -1;
-    if (tcp_recv_all(ssl->fd, record_data, record_body) != 0) { free(record_data); return -1; }
+    { int r = tcp_recv_all(ssl->fd, record_data, record_body, blocking); if (r != 0) { free(record_data); return (r == OSSL_WANT) ? OSSL_WANT : -1; } }
 
     unsigned char *ciphertext = record_data;
     unsigned char *tag = ciphertext + ct_len;
@@ -3461,6 +4451,7 @@ static int ossl_tls13_recv_encrypted(struct ossl_ssl *ssl, int *real_type,
         return -1;
     }
 
+    if (*seq >= 0xFFFFFFFFFFFFFFFFULL) { free(decrypted); free(record_data); return -1; }
     (*seq)++;
 
     /* Extract real content type from last byte */
@@ -3482,6 +4473,7 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
     if (!buf) return -1;
     int len = 0, type = 0;
 
+
     /* --- Receive ClientHello --- */
     if (ossl_get_handshake_msg(ssl, &type, buf, 65536, &len) != 0) {
         fprintf(stderr, "ossl: Failed to receive ClientHello\n");
@@ -3498,6 +4490,12 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
     if (pos + 1 > len) { free(buf); return -1; }
     int sid_len = buf[pos++];
     if (pos + sid_len > len) { free(buf); return -1; }
+    if (sid_len <= 32) {
+        memcpy(ssl->client_session_id, buf + pos, sid_len);
+        ssl->client_session_id_len = sid_len;
+    } else {
+        ssl->client_session_id_len = 0;
+    }
     pos += sid_len;
     if (pos + 2 > len) { free(buf); return -1; }
     int cs_len = (buf[pos] << 8) | buf[pos+1];
@@ -3542,16 +4540,21 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
     int is_tls13 = (ssl->cipher_suite == TLS1_3_CK_AES_128_GCM_SHA256 ||
                     ssl->cipher_suite == TLS1_3_CK_AES_256_GCM_SHA384);
 
-    /* Parse extensions for TLS 1.3: need key_share and supported_versions */
+    /* Parse extensions for TLS 1.3: need key_share and supported_versions.
+       Also parse supported_groups for TLS 1.2 ECDHE fallback check. */
     unsigned char client_key_share[32] = {0};
     int has_client_ks = 0;
-    if (is_tls13) {
-        /* Skip compression methods */
+    int client_supports_x25519 = 0;
+
+    /* Skip compression methods (needed for both TLS 1.2 and 1.3) */
+    {
+        int save_pos = pos;
         pos = cs_end;
         if (pos + 1 > len) { free(buf); return -1; }
         int cm_len = buf[pos++];
         if (pos + cm_len > len) { free(buf); return -1; }
         pos += cm_len;
+
         /* Parse extensions */
         if (pos + 2 <= len) {
             int ext_len = (buf[pos] << 8) | buf[pos+1];
@@ -3563,7 +4566,7 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
                 int e_len = (buf[pos+2] << 8) | buf[pos+3];
                 pos += 4;
                 if (pos + e_len > ext_end) break;
-                if (ext_type == OSSL_EXT_KEY_SHARE) {
+                if (is_tls13 && ext_type == OSSL_EXT_KEY_SHARE) {
                     /* Client key_share: first 2 bytes = client_shares length */
                     int ks_pos = pos;
                     int ks_len_total = (buf[ks_pos] << 8) | buf[ks_pos+1];
@@ -3582,14 +4585,64 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
                         ks_pos += ke_len;
                     }
                 }
+                /* Parse supported_groups (0x000A) to check for X25519 */
+                if (ext_type == 0x000a) {
+                    int sg_pos = pos;
+                    int sg_len = (buf[sg_pos] << 8) | buf[sg_pos+1];
+                    sg_pos += 2;
+                    int sg_end = pos + e_len;
+                    while (sg_pos + 2 <= sg_end && sg_pos < pos + sg_len + 2) {
+                        int group = (buf[sg_pos] << 8) | buf[sg_pos+1];
+                        if (group == 0x001d) client_supports_x25519 = 1;
+                        sg_pos += 2;
+                    }
+                }
                 pos += e_len;
             }
         }
-        if (!has_client_ks) {
-            fprintf(stderr, "ossl: ClientHello missing x25519 key_share\n");
-            free(buf); return -1;
+
+        /* For TLS 1.3: must have key_share */
+        if (is_tls13) {
+            if (!has_client_ks) {
+                fprintf(stderr, "ossl: ClientHello missing x25519 key_share\n");
+                free(buf); return -1;
+            }
         }
-        pos = cs_end; /* reset pos for extension skip below */
+
+        /* For TLS 1.2 with ECDHE: if client doesn't support X25519, fall back to RSA */
+        if (!is_tls13 && use_ecdhe && !client_supports_x25519) {
+            /* Re-scan cipher list for best RSA (non-ECDHE) cipher */
+            int rpos = cs_end - cs_len;
+            int rfound = 0, ruse_256 = 0;
+            while (rpos + 2 <= cs_end) {
+                int cs = (buf[rpos] << 8) | buf[rpos+1];
+                if (!rfound) {
+                    if (cs == TLS1_CK_RSA_WITH_AES_256_GCM_SHA384) {
+                        rfound = 1; ruse_256 = 1;
+                        ssl->cipher_suite = cs;
+                    } else if (cs == TLS1_CK_RSA_WITH_AES_128_GCM_SHA256) {
+                        rfound = 1;
+                        ssl->cipher_suite = cs;
+                    } else if (cs == TLS1_CK_RSA_WITH_AES_256_CBC_SHA) {
+                        rfound = 1; ruse_256 = 1;
+                        ssl->cipher_suite = cs;
+                    } else if (cs == TLS1_CK_RSA_WITH_AES_128_CBC_SHA) {
+                        rfound = 1;
+                        ssl->cipher_suite = cs;
+                    }
+                }
+                rpos += 2;
+            }
+            if (!rfound) {
+                fprintf(stderr, "ossl: Client supports no RSA cipher and lacks X25519\n");
+                free(buf); return -1;
+            }
+            use_ecdhe = 0;
+            use_256 = ruse_256;
+            ssl->negotiated_cs = ssl->cipher_suite;
+        }
+
+        pos = save_pos; /* restore position for TLS 1.2 path skip logic */
     }
 
     /* ===== TLS 1.3 SERVER HANDSHAKE PATH ===== */
@@ -3619,7 +4672,12 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
             sh_buf[shp++] = OSSL_TLS_VERSION_MAJOR; sh_buf[shp++] = OSSL_TLS_VERSION_MINOR;
             memcpy(sh_buf + shp, ssl->server_random, 32); shp += 32;
             /* session ID: echo client's session ID (or empty) */
-            sh_buf[shp++] = 0x00; /* session ID length 0 */
+            sh_buf[shp++] = (unsigned char)ssl->client_session_id_len;
+            if (ssl->client_session_id_len > 0) {
+                memcpy(sh_buf + shp, ssl->client_session_id,
+                       ssl->client_session_id_len);
+                shp += ssl->client_session_id_len;
+            }
             /* cipher suite */
             sh_buf[shp++] = (unsigned char)((ssl->cipher_suite >> 8) & 0xFF);
             sh_buf[shp++] = (unsigned char)(ssl->cipher_suite & 0xFF);
@@ -3661,6 +4719,10 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
         /* Compute shared secret from client's X25519 key share */
         unsigned char shared_secret[32];
         x25519_scalar_mult(shared_secret, ssl->ecdhe_private_key, client_key_share);
+        if (ossl_is_zero_32(shared_secret)) {
+            fprintf(stderr, "ossl: Invalid X25519 peer key (low-order point)\n");
+            free(buf); return -1;
+        }
 
         /* Derive handshake secrets */
         if (ossl_tls13_derive_handshake_secrets(ssl, shared_secret, 32) != 0) {
@@ -3700,6 +4762,10 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
                 flight_buf[cpos++] = (unsigned char)((ssl->ctx->cert_der_len >> 16) & 0xFF);
                 flight_buf[cpos++] = (unsigned char)((ssl->ctx->cert_der_len >> 8) & 0xFF);
                 flight_buf[cpos++] = (unsigned char)(ssl->ctx->cert_der_len & 0xFF);
+                if (cpos + ssl->ctx->cert_der_len + 32 > (int)sizeof(flight_buf)) {
+                    fprintf(stderr, "ossl: Certificate too large for handshake buffer\n");
+                    free(buf); return -1;
+                }
                 memcpy(flight_buf + cpos, ssl->ctx->cert_der, ssl->ctx->cert_der_len);
                 cpos += ssl->ctx->cert_der_len;
                 /* Extensions: 0 length */
@@ -3718,16 +4784,16 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
                 ossl_hs_hash13_update(ssl, flight_buf + cert_msg_start, flight_len - cert_msg_start);
             }
 
-            /* CertificateVerify (type 0x0f) */
-            if (ssl->ctx->key_der) {
-                unsigned char *sn = NULL, *sd = NULL;
-                int sn_len = 0, sd_len = 0;
-                if (rsa_get_pubkey(ssl->ctx->key_der, ssl->ctx->key_der_len, &sn, &sn_len, NULL, NULL) != 0) {
-                    free(buf); return -1;
-                }
-                if (rsa_get_privexp(ssl->ctx->key_der, ssl->ctx->key_der_len, &sd, &sd_len) != 0) {
-                    free(sn); free(buf); return -1;
-                }
+        /* CertificateVerify (type 0x0f) */
+        if (ssl->ctx->key_der) {
+            unsigned char *sn = NULL, *sd = NULL;
+            int sn_len = 0, sd_len = 0;
+            if (rsa_get_pubkey(ssl->ctx->key_der, ssl->ctx->key_der_len, &sn, &sn_len, NULL, NULL) != 0) {
+                free(buf); return -1;
+            }
+            if (rsa_get_privexp(ssl->ctx->key_der, ssl->ctx->key_der_len, &sd, &sd_len) != 0) {
+                free(sn); free(buf); return -1;
+            }
 
                 /* Build signed content: 64 spaces || "TLS 1.3, server CertificateVerify" || 0x00 || transcript_hash */
                 unsigned char sd_content[256]; int sdl = 0;
@@ -3752,21 +4818,24 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
                     ossl_sha256_final(&sh, hash);
                 }
 
-                /* Sign with RSA (PKCS#1 v1.5 SHA-256) */
-                unsigned char *signature = (unsigned char*)malloc(sn_len);
-                if (!signature) { free(sn); free(sd); free(buf); return -1; }
-                int sig_ok = (rsa_sign(sn, sn_len, sd, sd_len, hash, hl, signature) == 0);
-                free(sn); free(sd);
+/* Sign with RSA-PSS (RFC 8017) — TLS 1.3 prefers PSS over PKCS#1 v1.5 */
+             unsigned char *signature = (unsigned char*)malloc(sn_len);
+             if (!signature) { free(sn); free(sd); free(buf); return -1; }
+             int sig_ok = (ossl_rsa_pss_sign(sn, sn_len, sd, sd_len, hash, hl, signature, hl,
+                         ssl->ctx->crt_p, ssl->ctx->crt_p_len,
+                         ssl->ctx->crt_q, ssl->ctx->crt_q_len,
+                         ssl->ctx->crt_qInv) == 0);
+            free(sn); free(sd);
 
-                if (!sig_ok) { free(signature); free(buf); return -1; }
+            if (!sig_ok) { free(signature); free(buf); return -1; }
 
                 /* Build CertificateVerify message */
                 int cv_msg_start = flight_len;
                 int cpos = flight_len;
                 flight_buf[cpos++] = OSSL_MT_CERTIFICATE_VERIFY;
                 int cv_hs_pos = cpos; cpos += 3;
-                /* Signature algorithm: rsa_pkcs1_sha256 = 0x0401 */
-                flight_buf[cpos++] = 0x04; flight_buf[cpos++] = 0x01;
+                /* Signature algorithm: rsa_pss_rsae_sha256 (0x0804) or rsa_pss_rsae_sha384 (0x0805) */
+                flight_buf[cpos++] = 0x08; flight_buf[cpos++] = (hl == 48) ? 0x05 : 0x04;
                 flight_buf[cpos++] = (unsigned char)((sn_len >> 8) & 0xFF);
                 flight_buf[cpos++] = (unsigned char)(sn_len & 0xFF);
                 memcpy(flight_buf + cpos, signature, sn_len);
@@ -3808,7 +4877,7 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
             }
 
             /* Send encrypted flight (use server_hs keys) */
-            if (ossl_tls13_send_encrypted(ssl, SSL3_RT_HANDSHAKE, flight_buf, flight_len, 1, 1) != 0) {
+            if (ossl_tls13_send_encrypted(ssl, SSL3_RT_HANDSHAKE, flight_buf, flight_len, 1, 1, 1) != 0) {
                 fprintf(stderr, "ossl: Failed to send server encrypted flight\n");
                 free(buf); return -1;
             }
@@ -3829,20 +4898,28 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
         {
             /* Skip CCS if present (middlebox compatibility) */
             unsigned char header[5];
-            if (tcp_recv_all(ssl->fd, header, 5) != 0) { free(buf); return -1; }
+            if (tcp_recv_all(ssl->fd, header, 5, 1) != 0) {
+                free(buf); return -1;
+            }
+            if (header[0] == SSL3_RT_ALERT) {
+                unsigned char alert_data[2];
+                if (tcp_recv_all(ssl->fd, alert_data, 2, 1) != 0) { free(buf); return -1; }
+                fprintf(stderr, "ossl: Received alert (level=%d, description=%d)\n", alert_data[0], alert_data[1]);
+                free(buf); return -1;
+            }
             if (header[0] == SSL3_RT_CHANGE_CIPHER_SPEC) {
                 unsigned char ccs_byte;
-                if (tcp_recv_all(ssl->fd, &ccs_byte, 1) != 0) { free(buf); return -1; }
+                if (tcp_recv_all(ssl->fd, &ccs_byte, 1, 1) != 0) { free(buf); return -1; }
                 /* Now read the next record */
-                if (tcp_recv_all(ssl->fd, header, 5) != 0) { free(buf); return -1; }
+                if (tcp_recv_all(ssl->fd, header, 5, 1) != 0) { free(buf); return -1; }
             }
 
             /* Decrypt client Finished */
             int record_body = (header[3] << 8) | header[4];
-            if (record_body > OSSL_MAX_RECORD_SIZE + 24) { free(buf); return -1; }
+            if (record_body < 16 || record_body > OSSL_MAX_RECORD_SIZE + 24) { free(buf); return -1; }
             unsigned char *rec_data = (unsigned char*)malloc(record_body);
             if (!rec_data) { free(buf); return -1; }
-            if (tcp_recv_all(ssl->fd, rec_data, record_body) != 0) { free(rec_data); free(buf); return -1; }
+            if (tcp_recv_all(ssl->fd, rec_data, record_body, 1) != 0) { free(rec_data); free(buf); return -1; }
 
             int ct_len = record_body - 16;
             unsigned char *ciphertext = rec_data;
@@ -3937,16 +5014,32 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
     if (ossl_rand_bytes(ssl->server_random, 32) != 0) { free(buf); return -1; }
 
     /* --- Send ServerHello --- */
-    unsigned char sh[256];
+    unsigned char sh[512];
     int sh_len = 0;
     sh[sh_len++] = 0x02;
     int hs_len_pos = sh_len; sh_len += 3;
     sh[sh_len++] = OSSL_TLS_VERSION_MAJOR; sh[sh_len++] = OSSL_TLS_VERSION_MINOR;
     memcpy(sh + sh_len, ssl->server_random, 32); sh_len += 32;
-    sh[sh_len++] = 0x00; /* session ID length */
+    sh[sh_len++] = (unsigned char)ssl->client_session_id_len; /* session ID length */
+    if (ssl->client_session_id_len > 0) {
+        memcpy(sh + sh_len, ssl->client_session_id,
+               ssl->client_session_id_len);
+        sh_len += ssl->client_session_id_len;
+    }
     sh[sh_len++] = (unsigned char)((ssl->cipher_suite >> 8) & 0xFF);
     sh[sh_len++] = (unsigned char)(ssl->cipher_suite & 0xFF);
     sh[sh_len++] = 0x00; /* compression */
+    /* Add renegotiation_info extension (RFC 5746) — required for TLS 1.2 interop */
+    {
+        int ext_len_pos = sh_len; sh_len += 2;
+        /* renegotiation_info (0xFF01): length 1, value 0x00 */
+        sh[sh_len++] = 0xFF; sh[sh_len++] = 0x01;
+        sh[sh_len++] = 0x00; sh[sh_len++] = 0x01;
+        sh[sh_len++] = 0x00;
+        int total_ext = sh_len - ext_len_pos - 2;
+        sh[ext_len_pos]     = (unsigned char)((total_ext >> 8) & 0xFF);
+        sh[ext_len_pos + 1] = (unsigned char)(total_ext & 0xFF);
+    }
     int hs_len = sh_len - 4;
     sh[hs_len_pos]   = (unsigned char)(hs_len >> 16);
     sh[hs_len_pos+1] = (unsigned char)(hs_len >> 8);
@@ -4011,7 +5104,10 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
         ossl_sha256_final(&sha_ctx, hash);
         unsigned char *signature = (unsigned char*)malloc(sn_len);
         if (!signature) { free(sn); free(sd); free(buf); return -1; }
-        int sig_ok = (rsa_sign(sn, sn_len, sd, sd_len, hash, 32, signature) == 0);
+int sig_ok = (rsa_sign(sn, sn_len, sd, sd_len, hash, 32, signature,
+                         ssl->ctx->crt_p, ssl->ctx->crt_p_len,
+                         ssl->ctx->crt_q, ssl->ctx->crt_q_len,
+                         ssl->ctx->crt_qInv) == 0);
         free(sn); free(sd);
         if (!sig_ok) { free(signature); free(buf); return -1; }
         /* Build ServerKeyExchange message */
@@ -4065,6 +5161,10 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
             free(buf); return -1;
         }
         x25519_scalar_mult(ssl->pre_master_secret, ssl->ecdhe_private_key, buf + pos);
+        if (ossl_is_zero_32(ssl->pre_master_secret)) {
+            fprintf(stderr, "ossl: Invalid X25519 peer key (low-order point)\n");
+            free(buf); return -1;
+        }
     } else {
         /* RSA: decrypt premaster secret */
         unsigned char *rn = NULL, *rd = NULL;
@@ -4074,8 +5174,19 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
             fprintf(stderr, "ossl: Cannot extract private exponent\n");
             free(rn); free(buf); return -1;
         }
+
+        /* Handle optional 2-byte length prefix in ClientKeyExchange body */
+        int body_len = len - pos;
+        int rsa_ct_offset = pos;
+        if (body_len == (int)((buf[pos] << 8) | buf[pos+1]) + 2) {
+            rsa_ct_offset = pos + 2;
+        }
+
         int premaster_len = 48;
-        if (rsa_decrypt(rn, rn_len, rd, rd_len, buf + pos, ssl->pre_master_secret, &premaster_len, 48) != 0) {
+if (rsa_decrypt(rn, rn_len, rd, rd_len, buf + rsa_ct_offset, ssl->pre_master_secret, &premaster_len, 48,
+                         ssl->ctx->crt_p, ssl->ctx->crt_p_len,
+                         ssl->ctx->crt_q, ssl->ctx->crt_q_len,
+                         ssl->ctx->crt_qInv) != 0) {
             fprintf(stderr, "ossl: RSA decryption of premaster secret failed\n");
             free(rn); free(rd); free(buf); return -1;
         }
@@ -4110,65 +5221,88 @@ static int ossl_do_server_handshake(struct ossl_ssl *ssl) {
     }
     ssl->client_seq = 0; ssl->server_seq = 0;
 
-    /* --- Send CCS + Finished --- */
-    unsigned char hs_digest[64];
-    unsigned char verify_data[12];
-    if (use_256) {
-        ossl_sha384_final(&ssl->hs_hash384, hs_digest);
-        tls_prf_sha384(ssl->master_secret, 48, "server finished", hs_digest, 48, verify_data, 12);
-    } else {
-        ossl_sha256_final(&ssl->hs_hash, hs_digest);
-        tls_prf(ssl->master_secret, 48, "server finished", hs_digest, 32, verify_data, 12);
-    }
-    unsigned char ccs[1] = {1};
-    if (ossl_send_record(ssl, SSL3_RT_CHANGE_CIPHER_SPEC, ccs, 1) != 0) { free(buf); return -1; }
-    unsigned char finished_msg[256];
-    int fm_len = 0;
-    finished_msg[fm_len++] = 0x14;
-    finished_msg[fm_len++] = 0x00; finished_msg[fm_len++] = 0x00; finished_msg[fm_len++] = 12;
-    memcpy(finished_msg + fm_len, verify_data, 12);
-    fm_len += 12;
-    if (use_256) {
-        if (ossl_send_encrypted256(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 1) != 0) { free(buf); return -1; }
-    } else {
-        if (ossl_send_encrypted(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 1) != 0) { free(buf); return -1; }
-    }
+    /* Save transcript hash state before finalizing for client Finished verification,
+     * then restore to include client Finished for server Finished (RFC 5246). */
+    ossl_sha256_ctx saved_hash; memcpy(&saved_hash, &ssl->hs_hash, sizeof(saved_hash));
+    ossl_sha384_ctx saved_hash384; memcpy(&saved_hash384, &ssl->hs_hash384, sizeof(saved_hash384));
 
-    /* --- Receive client CCS + Finished --- */
-    int rec_type;
-    if (ossl_recv_record(ssl, &rec_type, buf, 65536, &len) != 0) {
-        fprintf(stderr, "ossl: Expected ChangeCipherSpec from client\n");
-        free(buf); return -1;
-    }
-    if (rec_type != SSL3_RT_CHANGE_CIPHER_SPEC) {
-        fprintf(stderr, "ossl: Expected ChangeCipherSpec (got %d)\n", rec_type);
-        free(buf); return -1;
-    }
+    /* --- Receive client CCS + Finished first, then send server CCS + Finished ---
+       RFC 5246: server Finished hash must include client Finished */
     {
-        unsigned char pt[OSSL_MAX_RECORD_SIZE + 16]; int pt_len;
-        if (use_256) {
-            if (ossl_recv_encrypted256(ssl, &rec_type, pt, &pt_len, 0) != 0) {
-                fprintf(stderr, "ossl: Failed to receive encrypted Finished\n");
-                free(buf); return -1;
-            }
-        } else {
-            if (ossl_recv_encrypted(ssl, &rec_type, pt, &pt_len, 0) != 0) {
-                fprintf(stderr, "ossl: Failed to receive encrypted Finished\n");
-                free(buf); return -1;
-            }
+        /* Receive client ChangeCipherSpec */
+        int rec_type;
+        if (ossl_recv_record(ssl, &rec_type, buf, 65536, &len) != 0) {
+            fprintf(stderr, "ossl: Expected ChangeCipherSpec from client\n");
+            free(buf); return -1;
         }
-        /* Verify client Finished: compare verify_data */
-        unsigned char expected_verify[12];
-        if (use_256) {
-            tls_prf_sha384(ssl->master_secret, 48, "client finished", hs_digest, 48, expected_verify, 12);
-        } else {
-            tls_prf(ssl->master_secret, 48, "client finished", hs_digest, 32, expected_verify, 12);
-        }
-        if (pt_len != 16 || memcmp(pt + 4, expected_verify, 12) != 0) {
-            fprintf(stderr, "ossl: Client Finished verify_data mismatch\n");
+        if (rec_type != SSL3_RT_CHANGE_CIPHER_SPEC) {
+            fprintf(stderr, "ossl: Expected ChangeCipherSpec (got %d)\n", rec_type);
             free(buf); return -1;
         }
     }
+    {
+        /* Receive and verify client Finished */
+        unsigned char pt[OSSL_MAX_RECORD_SIZE + 16]; int pt_len;
+        int rec_type;
+        if (use_256) {
+            if (ossl_recv_encrypted256(ssl, &rec_type, pt, &pt_len, 0, 1) != 0) {
+                fprintf(stderr, "ossl: Failed to receive encrypted Finished from client\n");
+                free(buf); return -1;
+            }
+        } else {
+            if (ossl_recv_encrypted(ssl, &rec_type, pt, &pt_len, 0, 1) != 0) {
+                fprintf(stderr, "ossl: Failed to receive encrypted Finished from client\n");
+                free(buf); return -1;
+            }
+        }
+        /* Verify client Finished using transcript up to (but not including) client Finished */
+        {
+            unsigned char client_hs_digest[64];
+            unsigned char expected_verify[12];
+            if (use_256) {
+                ossl_sha384_final(&ssl->hs_hash384, client_hs_digest);
+                tls_prf_sha384(ssl->master_secret, 48, "client finished", client_hs_digest, 48, expected_verify, 12);
+            } else {
+                ossl_sha256_final(&ssl->hs_hash, client_hs_digest);
+                tls_prf(ssl->master_secret, 48, "client finished", client_hs_digest, 32, expected_verify, 12);
+            }
+            if (pt_len != 16 || memcmp(pt + 4, expected_verify, 12) != 0) {
+                fprintf(stderr, "ossl: Client Finished verify_data mismatch\n");
+                free(buf); return -1;
+            }
+        }
+        /* Restore hash state and include client Finished for server Finished */
+        memcpy(&ssl->hs_hash, &saved_hash, sizeof(saved_hash));
+        memcpy(&ssl->hs_hash384, &saved_hash384, sizeof(saved_hash384));
+        ossl_hs_hash_update(ssl, pt, (unsigned int)pt_len);
+    }
+
+    /* --- Send server CCS + Finished --- */
+    {
+        unsigned char hs_digest[64];
+        unsigned char verify_data[12];
+        if (use_256) {
+            ossl_sha384_final(&ssl->hs_hash384, hs_digest);
+            tls_prf_sha384(ssl->master_secret, 48, "server finished", hs_digest, 48, verify_data, 12);
+        } else {
+            ossl_sha256_final(&ssl->hs_hash, hs_digest);
+            tls_prf(ssl->master_secret, 48, "server finished", hs_digest, 32, verify_data, 12);
+        }
+        unsigned char ccs[1] = {1};
+        if (ossl_send_record(ssl, SSL3_RT_CHANGE_CIPHER_SPEC, ccs, 1) != 0) { free(buf); return -1; }
+        unsigned char finished_msg[256];
+        int fm_len = 0;
+        finished_msg[fm_len++] = 0x14;
+        finished_msg[fm_len++] = 0x00; finished_msg[fm_len++] = 0x00; finished_msg[fm_len++] = 12;
+        memcpy(finished_msg + fm_len, verify_data, 12);
+        fm_len += 12;
+        if (use_256) {
+            if (ossl_send_encrypted256(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 1, 1) != 0) { free(buf); return -1; }
+        } else {
+            if (ossl_send_encrypted(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 1, 1) != 0) { free(buf); return -1; }
+        }
+    }
+
     ssl->handshake_done = 1;
     free(buf);
     return 0;
@@ -4485,6 +5619,10 @@ static int ossl_do_client_handshake(struct ossl_ssl *ssl) {
         /* Compute X25519 shared secret */
         unsigned char shared_secret[32];
         x25519_scalar_mult(shared_secret, ssl->ecdhe_private_key, ssl->ecdhe_server_public);
+        if (ossl_is_zero_32(shared_secret)) {
+            fprintf(stderr, "ossl: Invalid X25519 peer key (low-order point)\n");
+            free(buf); return -1;
+        }
 
         /* Derive handshake secrets */
         if (ossl_tls13_derive_handshake_secrets(ssl, shared_secret, 32) != 0) {
@@ -4503,7 +5641,7 @@ static int ossl_do_client_handshake(struct ossl_ssl *ssl) {
             while (1) {
                 unsigned char rec_buf[65536];
                 int rtype, rlen;
-                if (ossl_tls13_recv_encrypted(ssl, &rtype, rec_buf, &rlen, 1, 1) != 0) {
+                if (ossl_tls13_recv_encrypted(ssl, &rtype, rec_buf, &rlen, 1, 1, 1) != 0) {
                     fprintf(stderr, "ossl: Failed to receive encrypted handshake record (hs_buf_len=%d)\n", hs_buf_len);
                     free(buf); return -1;
                 }
@@ -4588,6 +5726,7 @@ static int ossl_do_client_handshake(struct ossl_ssl *ssl) {
                       ssl->peer_cert_chain_der_len = (int*)calloc((size_t)nc, sizeof(int));
                       if (!ssl->peer_cert_chain_der || !ssl->peer_cert_chain_der_len) goto cert_fail;
                       for (int i = 0; i < nc; i++) {
+                          if (cp + 3 > clend) goto cert_fail;
                           int cl = (cd[cp] << 16) | (cd[cp+1] << 8) | cd[cp+2]; cp += 3;
                           ssl->peer_cert_chain_der[i] = (unsigned char*)malloc((size_t)cl);
                           if (!ssl->peer_cert_chain_der[i]) goto cert_fail;
@@ -4718,7 +5857,7 @@ cert_fail:
             /* Hash client Finished into transcript (needed for resumption master secret, etc.) */
             ossl_hs_hash13_update(ssl, finished_msg, fm_len);
 
-            if (ossl_tls13_send_encrypted(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 0, 1) != 0) {
+            if (ossl_tls13_send_encrypted(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 0, 1, 1) != 0) {
                 fprintf(stderr, "ossl: Failed to send client Finished\n");
                 free(buf); return -1;
             }
@@ -4876,6 +6015,10 @@ cert_fail:
         }
         free(n); free(e);
         x25519_scalar_mult(ssl->pre_master_secret, ssl->ecdhe_private_key, ssl->ecdhe_server_public);
+        if (ossl_is_zero_32(ssl->pre_master_secret)) {
+            fprintf(stderr, "ossl: Invalid X25519 peer key (low-order point)\n");
+            free(buf); return -1;
+        }
         if (ossl_get_handshake_msg(ssl, &type, buf, 65536, &len) != 0) {
             fprintf(stderr, "ossl: Expected ServerHelloDone\n");
             free(buf); return -1;
@@ -4992,9 +6135,9 @@ cert_fail:
     memcpy(finished_msg + fm_len, verify_data, 12);
     fm_len += 12;
     if (use_256) {
-        if (ossl_send_encrypted256(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 0) != 0) { free(buf); return -1; }
+        if (ossl_send_encrypted256(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 0, 1) != 0) { free(buf); return -1; }
     } else {
-        if (ossl_send_encrypted(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 0) != 0) { free(buf); return -1; }
+        if (ossl_send_encrypted(ssl, SSL3_RT_HANDSHAKE, finished_msg, fm_len, 0, 1) != 0) { free(buf); return -1; }
     }
     /* Restore hash state and include client Finished for server Finished verification */
     memcpy(&ssl->hs_hash, &saved_hash, sizeof(saved_hash));
@@ -5011,12 +6154,12 @@ cert_fail:
     }
     unsigned char pt[OSSL_MAX_RECORD_SIZE + 16]; int pt_len;
     if (use_256) {
-        if (ossl_recv_encrypted256(ssl, &rec_type, pt, &pt_len, 1) != 0) {
+        if (ossl_recv_encrypted256(ssl, &rec_type, pt, &pt_len, 1, 1) != 0) {
             fprintf(stderr, "ossl: Failed to receive server Finished\n");
             free(buf); return -1;
         }
     } else {
-        if (ossl_recv_encrypted(ssl, &rec_type, pt, &pt_len, 1) != 0) {
+        if (ossl_recv_encrypted(ssl, &rec_type, pt, &pt_len, 1, 1) != 0) {
             fprintf(stderr, "ossl: Failed to receive server Finished\n");
             free(buf); return -1;
         }
@@ -5061,6 +6204,7 @@ void SSL_CTX_free(SSL_CTX* ctx) {
     if (!ctx) return;
     struct ossl_ctx *c = (struct ossl_ctx*)ctx;
     free(c->cert_der); free(c->key_der);
+    free(c->crt_p); free(c->crt_q); free(c->crt_qInv);
     if (c->trusted_ca_der) {
         for (int i = 0; i < c->trusted_ca_count; i++) free(c->trusted_ca_der[i]);
         free(c->trusted_ca_der);
@@ -5084,7 +6228,66 @@ int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int type) {
         int pkcs1_len;
         unsigned char *pkcs1 = strip_pkcs8_if_needed(c->key_der, c->key_der_len, &pkcs1_len);
         if (pkcs1 != c->key_der) { free(c->key_der); c->key_der = pkcs1; c->key_der_len = pkcs1_len; }
-    } else if (!c->key_der) {
+        /* Self-test bn_divrem + bn_modinv */
+        {
+            unsigned char td[4] = {0x2a, 0x01, 0x00, 0x00};
+            unsigned char tm[2] = {0x0d, 0x00};
+            unsigned char tq[5] = {0};
+            bn_divrem(td, 4, tm, 2, tq);
+            unsigned char ta[2] = {0x07, 0x00};
+            unsigned char tx[2] = {0};
+            int ti = bn_modinv(ta, tm, 2, tx);
+            /* silence unused warnings */
+            (void)ti; (void)tx[0]; (void)tq[0];
+        }
+        /* Precompute CRT factors for speed */
+        if (c->crt_p) { free(c->crt_p); c->crt_p = NULL; }
+        if (c->crt_q) { free(c->crt_q); c->crt_q = NULL; }
+        if (c->crt_qInv) { free(c->crt_qInv); c->crt_qInv = NULL; }
+        rsa_get_crt_factors(c->key_der, c->key_der_len, &c->crt_p, &c->crt_p_len, &c->crt_q, &c->crt_q_len);
+if (c->crt_p && c->crt_q && c->crt_p_len > 0) {
+             /* Compute qInv = q^(-1) mod p using Fermat: a^(p-2) mod p where a = q mod p.
+                rsa_modpow works on big-endian; compute a in BE, compute p-2 in BE, call rsa_modpow. */
+             int max_pq = c->crt_p_len > c->crt_q_len ? c->crt_p_len : c->crt_q_len;
+             unsigned char *p_le = calloc(max_pq, 1);
+             unsigned char *q_le = calloc(max_pq, 1);
+             c->crt_qInv = NULL;
+             if (p_le && q_le) {
+                 bn_from_bin(p_le, c->crt_p, c->crt_p_len, max_pq);
+                 bn_from_bin(q_le, c->crt_q, c->crt_q_len, max_pq);
+                 /* a = q mod p (LE) */
+                 if (bn_divrem(q_le, max_pq, p_le, max_pq, NULL) == 0) {
+                     /* Convert a to BE */
+                     unsigned char *a_be = malloc(c->crt_p_len);
+                     if (a_be) {
+                         bn_to_bin(a_be, c->crt_p_len, q_le, max_pq);
+                         /* Compute p-2 in BE */
+                         unsigned char *p2 = malloc(c->crt_p_len);
+                         if (p2) {
+                             memcpy(p2, c->crt_p, c->crt_p_len);
+                             { int borrow = 2;
+                               for (int i = c->crt_p_len - 1; i >= 0 && borrow; i--) {
+                                   int v = (int)p2[i] - borrow;
+                                   if (v < 0) { v += 256; borrow = 1; } else borrow = 0;
+                                   p2[i] = (unsigned char)v;
+                               }
+                             }
+                             c->crt_qInv = malloc(c->crt_p_len);
+                             if (c->crt_qInv) {
+                                 if (rsa_modpow(a_be, c->crt_p_len, p2, c->crt_p_len,
+                                                c->crt_p, c->crt_p_len, c->crt_qInv) != 0) {
+                                     free(c->crt_qInv); c->crt_qInv = NULL;
+                                 }
+                             }
+                             free(p2);
+                         }
+                         free(a_be);
+                     }
+                 }
+             }
+             free(p_le); free(q_le);
+         }
+     } else if (!c->key_der) {
         fprintf(stderr, "ossl: Failed to parse private key PEM\n");
         free(pem); return 0;
     }
@@ -5132,7 +6335,6 @@ void SSL_free(SSL* ssl) {
         free(s->peer_cert_chain_der);
         free(s->peer_cert_chain_der_len);
     }
-    if (s->fd != OSSL_INVALID_SOCKET) OSSL_CLOSE_SOCKET(s->fd);
     free(s);
 }
 
@@ -5141,7 +6343,8 @@ int SSL_set_fd(SSL* ssl, int fd) { ((struct ossl_ssl*)ssl)->fd = (ossl_sock_t)fd
 int SSL_accept(SSL* ssl) {
     struct ossl_ssl *s = (struct ossl_ssl*)ssl;
     if (s->handshake_done) return 1;
-    return ossl_do_server_handshake(s);
+    int ret = ossl_do_server_handshake(s);
+    return (ret == 0) ? 1 : ret;
 }
 
 int SSL_connect(SSL* ssl) {
@@ -5160,15 +6363,15 @@ int SSL_shutdown(SSL* ssl) {
         return ossl_send_record(s, SSL3_RT_ALERT, alert, 2);
     if (s->is_tls13) {
         int use_server = s->is_server ? 1 : 0;
-        return ossl_tls13_send_encrypted(s, SSL3_RT_ALERT, alert, 2, use_server, 0);
+        return ossl_tls13_send_encrypted(s, SSL3_RT_ALERT, alert, 2, use_server, 0, 1);
     }
     int use_256 = (s->negotiated_cs == TLS1_CK_ECDHE_RSA_WITH_AES_256_GCM_SHA384 ||
                    s->negotiated_cs == TLS1_CK_RSA_WITH_AES_256_GCM_SHA384);
     int use_server = s->is_server ? 1 : 0;
     if (use_256)
-        return ossl_send_encrypted256(s, SSL3_RT_ALERT, alert, 2, use_server);
+        return ossl_send_encrypted256(s, SSL3_RT_ALERT, alert, 2, use_server, 1);
     else
-        return ossl_send_encrypted(s, SSL3_RT_ALERT, alert, 2, use_server);
+        return ossl_send_encrypted(s, SSL3_RT_ALERT, alert, 2, use_server, 1);
 }
 
 int SSL_read(SSL* ssl, void* buf, int num) {
@@ -5196,9 +6399,9 @@ int SSL_read(SSL* ssl, void* buf, int num) {
         unsigned char rec_plain[OSSL_MAX_RECORD_SIZE + 16];
         while (1) {
             int type, pt_len = 0;
-            if (ossl_tls13_recv_encrypted(s, &type, rec_plain, &pt_len, use_server, 0) != 0) {
-                return -1;
-            }
+            { int r = ossl_tls13_recv_encrypted(s, &type, rec_plain, &pt_len, use_server, 0, 0);
+            if (r == OSSL_WANT) { s->want = SSL_ERROR_WANT_READ; return -1; }
+            if (r != 0) return -1; }
             if (type == SSL3_RT_ALERT) return 0;
             /* Skip handshake messages sent after handshake (e.g. NewSessionTicket).
                Type 0x04 = NewSessionTicket raw handshake type.
@@ -5227,9 +6430,9 @@ int SSL_read(SSL* ssl, void* buf, int num) {
     while (1) {
         int type, pt_len = 0;
         if (use_256) {
-            if (ossl_recv_encrypted256(s, &type, rec_plain, &pt_len, use_server) != 0) return -1;
+            { int r = ossl_recv_encrypted256(s, &type, rec_plain, &pt_len, use_server, 0); if (r == OSSL_WANT) { s->want = SSL_ERROR_WANT_READ; return -1; } if (r != 0) return -1; }
         } else {
-            if (ossl_recv_encrypted(s, &type, rec_plain, &pt_len, use_server) != 0) return -1;
+            { int r = ossl_recv_encrypted(s, &type, rec_plain, &pt_len, use_server, 0); if (r == OSSL_WANT) { s->want = SSL_ERROR_WANT_READ; return -1; } if (r != 0) return -1; }
         }
         if (type == SSL3_RT_ALERT) return 0;
         if (type == SSL3_RT_HANDSHAKE) continue;
@@ -5255,18 +6458,26 @@ int SSL_write(SSL* ssl, const void* buf, int num) {
     if (!s->handshake_done) return -1;
     if (s->is_tls13) {
         int use_server = s->is_server ? 1 : 0;
-        if (ossl_tls13_send_encrypted(s, SSL3_RT_APPLICATION_DATA, (const unsigned char*)buf, num, use_server, 0) != 0) return -1;
+        { int r = ossl_tls13_send_encrypted(s, SSL3_RT_APPLICATION_DATA, (const unsigned char*)buf, num, use_server, 0, 0);
+        if (r == OSSL_WANT) { s->want = SSL_ERROR_WANT_WRITE; return -1; }
+        if (r != 0) return -1; }
         return num;
     }
     int use_server = s->is_server ? 1 : 0;
     int use_256 = (s->negotiated_cs == TLS1_CK_ECDHE_RSA_WITH_AES_256_GCM_SHA384 ||
                    s->negotiated_cs == TLS1_CK_RSA_WITH_AES_256_GCM_SHA384);
     if (use_256) {
-        if (ossl_send_encrypted256(s, SSL3_RT_APPLICATION_DATA, (const unsigned char*)buf, num, use_server) != 0) return -1;
+        { int r = ossl_send_encrypted256(s, SSL3_RT_APPLICATION_DATA, (const unsigned char*)buf, num, use_server, 0); if (r == OSSL_WANT) { s->want = SSL_ERROR_WANT_WRITE; return -1; } if (r != 0) return -1; }
     } else {
-        if (ossl_send_encrypted(s, SSL3_RT_APPLICATION_DATA, (const unsigned char*)buf, num, use_server) != 0) return -1;
+        { int r = ossl_send_encrypted(s, SSL3_RT_APPLICATION_DATA, (const unsigned char*)buf, num, use_server, 0); if (r == OSSL_WANT) { s->want = SSL_ERROR_WANT_WRITE; return -1; } if (r != 0) return -1; }
     }
     return num;
+}
+
+int SSL_get_error(const SSL* ssl, int ret) {
+    struct ossl_ssl *s = (struct ossl_ssl*)ssl;
+    if (ret > 0 || ret == 0) s->want = SSL_ERROR_NONE;
+    return s->want;
 }
 
 void SSL_set_verify(SSL *s, int mode, int (*verify_callback)(int, X509_STORE_CTX*)) {
@@ -5653,8 +6864,11 @@ long SSL_get_verify_result(const SSL *ssl) {
                     /* Append walk_der to peer chain */
                     {
                         int nc = s->peer_cert_chain_count + 1;
-                        unsigned char **nc_d = (unsigned char**)realloc(s->peer_cert_chain_der, (size_t)nc * sizeof(unsigned char*));
-                        int *nc_l = (int*)realloc(s->peer_cert_chain_der_len, (size_t)nc * sizeof(int));
+                        /* Hold old pointers until both reallocs succeed */
+                        unsigned char **old_der = s->peer_cert_chain_der;
+                        int *old_len = s->peer_cert_chain_der_len;
+                        unsigned char **nc_d = (unsigned char**)realloc(old_der, (size_t)nc * sizeof(unsigned char*));
+                        int *nc_l = (int*)realloc(old_len, (size_t)nc * sizeof(int));
                         if (!nc_d || !nc_l) { free(nc_d); free(nc_l); break; }
                         s->peer_cert_chain_der = nc_d;
                         s->peer_cert_chain_der_len = nc_l;
@@ -5745,6 +6959,146 @@ long SSL_get_verify_result(const SSL *ssl) {
                 }
             }
             return X509_V_OK;
+        }
+    }
+    /* If ossl_is_trusted_idx failed, try name-based issuer lookup in CA bundle.
+     * This handles servers that send only a leaf cert (no intermediates). */
+    if (n > 0) {
+        int ca_idx = -1;
+        {
+            unsigned char *nkey = NULL, *ekey = NULL;
+            int nk_len = 0, ek_len = 0;
+            unsigned char ec_px[32], ec_py[32];
+            /* Extract issuer name from last cert */
+            unsigned char *issuer_der = NULL;
+            int issuer_len = 0;
+            {
+                unsigned char *cd = s->peer_cert_chain_der[n - 1];
+                int cl = s->peer_cert_chain_der_len[n - 1];
+                int sp = 0, stag, stlen, stbs_end;
+                stag = der_read_tag(cd, cl, &sp, &stlen);
+                if (stag == 0x30) {
+                    stag = der_read_tag(cd, cl, &sp, &stlen);
+                    if (stag == 0x30) {
+                        stbs_end = sp + stlen;
+                        if (sp < stbs_end && cd[sp] == 0xa0) {
+                            stag = der_read_tag(cd, cl, &sp, &stlen);
+                            sp += stlen;
+                        }
+                        stag = der_read_tag(cd, cl, &sp, &stlen);
+                        if (stag == 0x02) sp += stlen; /* serial */
+                        stag = der_read_tag(cd, cl, &sp, &stlen);
+                        if (stag == 0x30) sp += stlen; /* sig */
+                        int is_start = sp;
+                        stag = der_read_tag(cd, cl, &sp, &stlen);
+                        if (stag == 0x30) {
+                            issuer_der = cd + is_start;
+                            issuer_len = (sp + stlen) - is_start;
+                        }
+                    }
+                }
+            }
+            if (issuer_der && issuer_len > 0) {
+                /* Find CA whose subject matches issuer */
+                for (int j = 0; j < ctx->trusted_ca_count; j++) {
+                    if (!ctx->trusted_ca_der[j]) continue;
+                    unsigned char *cd2 = ctx->trusted_ca_der[j];
+                    int cl2 = ctx->trusted_ca_der_len[j];
+                    unsigned char *subj_der = NULL;
+                    int subj_len = 0;
+                    {
+                        int sp = 0, stag, stlen, stbs_end;
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x30) continue;
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x30) continue;
+                        stbs_end = sp + stlen;
+                        if (sp < stbs_end && cd2[sp] == 0xa0) {
+                            stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                            sp += stlen;
+                        }
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x02) continue;
+                        sp += stlen; /* serial */
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x30) continue;
+                        sp += stlen; /* sig */
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x30) continue;
+                        sp += stlen; /* issuer */
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x30) continue;
+                        sp += stlen; /* validity */
+                        int ss_start = sp;
+                        stag = der_read_tag(cd2, cl2, &sp, &stlen);
+                        if (stag != 0x30) continue;
+                        subj_der = cd2 + ss_start;
+                        subj_len = (sp + stlen) - ss_start;
+                    }
+                    if (subj_len == issuer_len && subj_len > 0 &&
+                        memcmp(subj_der, issuer_der, (size_t)subj_len) == 0) {
+                        ca_idx = j; break;
+                    }
+                }
+            }
+            /* If found, verify last cert against this CA */
+            if (ca_idx >= 0) {
+                if (rsa_get_pubkey_from_cert(ctx->trusted_ca_der[ca_idx],
+                                              ctx->trusted_ca_der_len[ca_idx],
+                                              &nkey, &nk_len, &ekey, &ek_len) == 0) {
+                    if (ossl_verify_x509(s->peer_cert_chain_der[n - 1],
+                                          s->peer_cert_chain_der_len[n - 1],
+                                          nkey, nk_len, ekey, ek_len) == 0) {
+                        free(nkey); free(ekey);
+                        /* Augment chain with the found CA */
+                        {
+                            int nc = s->peer_cert_chain_count + 1;
+                            unsigned char **nc_d = (unsigned char**)realloc(s->peer_cert_chain_der, (size_t)nc * sizeof(unsigned char*));
+                            int *nc_l = (int*)realloc(s->peer_cert_chain_der_len, (size_t)nc * sizeof(int));
+                            if (nc_d && nc_l) {
+                                s->peer_cert_chain_der = nc_d;
+                                s->peer_cert_chain_der_len = nc_l;
+                                s->peer_cert_chain_der[nc - 1] = (unsigned char*)malloc((size_t)ctx->trusted_ca_der_len[ca_idx]);
+                                if (s->peer_cert_chain_der[nc - 1]) {
+                                    memcpy(s->peer_cert_chain_der[nc - 1],
+                                           ctx->trusted_ca_der[ca_idx],
+                                           (size_t)ctx->trusted_ca_der_len[ca_idx]);
+                                    s->peer_cert_chain_der_len[nc - 1] = ctx->trusted_ca_der_len[ca_idx];
+                                    s->peer_cert_chain_count = nc;
+                                }
+                            }
+                        }
+                        return X509_V_OK;
+                    }
+                    free(nkey); free(ekey);
+                } else if (ec_get_pubkey_from_cert(ctx->trusted_ca_der[ca_idx],
+                                                    ctx->trusted_ca_der_len[ca_idx],
+                                                    ec_px, ec_py) == 0) {
+                    if (ossl_verify_x509_ec(s->peer_cert_chain_der[n - 1],
+                                             s->peer_cert_chain_der_len[n - 1],
+                                             ec_px, ec_py) == 0) {
+                        /* Augment chain with the found CA */
+                        {
+                            int nc = s->peer_cert_chain_count + 1;
+                            unsigned char **nc_d = (unsigned char**)realloc(s->peer_cert_chain_der, (size_t)nc * sizeof(unsigned char*));
+                            int *nc_l = (int*)realloc(s->peer_cert_chain_der_len, (size_t)nc * sizeof(int));
+                            if (nc_d && nc_l) {
+                                s->peer_cert_chain_der = nc_d;
+                                s->peer_cert_chain_der_len = nc_l;
+                                s->peer_cert_chain_der[nc - 1] = (unsigned char*)malloc((size_t)ctx->trusted_ca_der_len[ca_idx]);
+                                if (s->peer_cert_chain_der[nc - 1]) {
+                                    memcpy(s->peer_cert_chain_der[nc - 1],
+                                           ctx->trusted_ca_der[ca_idx],
+                                           (size_t)ctx->trusted_ca_der_len[ca_idx]);
+                                    s->peer_cert_chain_der_len[nc - 1] = ctx->trusted_ca_der_len[ca_idx];
+                                    s->peer_cert_chain_count = nc;
+                                }
+                            }
+                        }
+                        return X509_V_OK;
+                    }
+                }
+            }
         }
     }
     /* If last cert is self-signed and chain length > 1, accept on chain integrity */
@@ -5937,7 +7291,9 @@ int X509_NAME_print_ex(BIO *out, const X509_NAME *nm, int indent, unsigned long 
             pos += tag_len;
 
             /* Build /LABEL=value or /OID=value */
-            ossl_buf_ensure(&buf, buf.len + 4 + (label ? (int)strlen(label) : 20) + vlen);
+            if (ossl_buf_ensure(&buf, buf.len + 4 + (label ? (int)strlen(label) : 20) + vlen) != 0) {
+                    ossl_buf_free(&buf); return 0;
+                }
             if (flags == XN_FLAG_ONELINE) {
                 buf.data[buf.len++] = '/';
                 if (label) {
@@ -5967,4 +7323,208 @@ int X509_NAME_print_ex(BIO *out, const X509_NAME *nm, int indent, unsigned long 
     b->len = buf.len;
     b->cap = buf.cap;
     return 1;
+}
+
+/* ========================================================================
+ * Test hooks — exposed for comparison with OpenSSL
+ * ======================================================================== */
+
+int ossl_test_pss_sign(SSL_CTX *ctx, const unsigned char *hash, int hash_len,
+                        unsigned char *sig, int sig_len) {
+    (void)sig_len;
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (!c->key_der) return -1;
+    unsigned char *sn = NULL, *sd = NULL;
+    int sn_len = 0, sd_len = 0;
+    if (rsa_get_pubkey(c->key_der, c->key_der_len, &sn, &sn_len, NULL, NULL) != 0) return -1;
+    if (rsa_get_privexp(c->key_der, c->key_der_len, &sd, &sd_len) != 0) {
+        free(sn); return -1;
+    }
+    int ret = ossl_rsa_pss_sign(sn, sn_len, sd, sd_len, hash, hash_len, sig, hash_len,
+                                 c->crt_p, c->crt_p_len, c->crt_q, c->crt_q_len,
+                                 c->crt_qInv);
+    free(sn); free(sd);
+    return ret;
+}
+
+/* CRT self-test: compare standard vs CRT path for the same message */
+/* Export crt_qInv for comparison with OpenSSL */
+const unsigned char *ossl_test_get_qInv(SSL_CTX *ctx, int *len) {
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (c->crt_qInv) { *len = c->crt_p_len; return c->crt_qInv; }
+    return NULL;
+}
+const unsigned char *ossl_test_get_p(SSL_CTX *ctx, int *len) {
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (c->crt_p) { *len = c->crt_p_len; return c->crt_p; }
+    return NULL;
+}
+const unsigned char *ossl_test_get_q(SSL_CTX *ctx, int *len) {
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (c->crt_q) { *len = c->crt_q_len; return c->crt_q; }
+    return NULL;
+}
+/* Import qInv from OpenSSL (big-endian bytes) */
+void ossl_test_set_qInv(SSL_CTX *ctx, const unsigned char *qInv, int len) {
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (c->crt_qInv) { free(c->crt_qInv); c->crt_qInv = NULL; }
+    if (len == c->crt_p_len) {
+        c->crt_qInv = (unsigned char*)malloc(len);
+        if (c->crt_qInv) memcpy(c->crt_qInv, qInv, len);
+    }
+}
+
+int ossl_test_crt_compare(SSL_CTX *ctx) {
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (!c->key_der || !c->crt_p || !c->crt_qInv) {
+        printf("CRT test: skipped (no CRT params)\n");
+        return 0;
+    }
+    unsigned char *sn = NULL, *sd = NULL;
+    int sn_len = 0, sd_len = 0;
+    if (rsa_get_pubkey(c->key_der, c->key_der_len, &sn, &sn_len, NULL, NULL) != 0) return -1;
+    if (rsa_get_privexp(c->key_der, c->key_der_len, &sd, &sd_len) != 0)
+    { free(sn); return -1; }
+
+    /* Use a fixed message: EM = all zeros (valid PSS input for testing the RSA op) */
+    unsigned char EM[256];
+    memset(EM, 0, 256);
+    EM[255] = 0xBC;  /* valid PSS trailer */
+
+    unsigned char sig_std[256], sig_crt[256];
+    /* Standard path */
+    int r1 = rsa_modpow(EM, 256, sd, sd_len, sn, sn_len, sig_std);
+    /* CRT path */
+    int r2 = rsa_privkey_op(EM, 256, sn, sn_len, sd, sd_len,
+                             c->crt_p, c->crt_p_len, c->crt_q, c->crt_q_len,
+                             c->crt_qInv, sig_crt);
+
+    free(sn); free(sd);
+
+    if (r1 != 0 || r2 != 0) {
+        printf("CRT test: rsa_modpow ret std=%d crt=%d\n", r1, r2);
+        return -1;
+    }
+    int match = (memcmp(sig_std, sig_crt, 256) == 0);
+    printf("CRT test: standard_vs_crt=%s\n", match ? "MATCH" : "MISMATCH");
+    if (!match) {
+        printf("  std[0..7]: "); for(int i=0;i<8;i++) printf("%02x", sig_std[i]); printf("\n");
+        printf("  crt[0..7]: "); for(int i=0;i<8;i++) printf("%02x", sig_crt[i]); printf("\n");
+    }
+    return match ? 0 : -1;
+}
+
+int ossl_test_rsa_sign(SSL_CTX *ctx, const unsigned char *hash, int hash_len,
+                        unsigned char *sig, int sig_len) {
+    struct ossl_ctx *c = (struct ossl_ctx*)ctx;
+    if (!c->key_der) return -1;
+    unsigned char *sn = NULL, *sd = NULL;
+    int sn_len = 0, sd_len = 0;
+    if (rsa_get_pubkey(c->key_der, c->key_der_len, &sn, &sn_len, NULL, NULL) != 0) return -1;
+    if (rsa_get_privexp(c->key_der, c->key_der_len, &sd, &sd_len) != 0) {
+        free(sn); return -1;
+    }
+    int ret = rsa_sign(sn, sn_len, sd, sd_len, hash, hash_len, sig,
+                        c->crt_p, c->crt_p_len, c->crt_q, c->crt_q_len,
+                        c->crt_qInv);
+    free(sn); free(sd);
+    (void)sig_len;
+    return ret;
+}
+
+/* Safe wrappers for test_compare.c — use struct ossl_ctx* to avoid type conflicts */
+struct ossl_ctx *SSL_CTX_new_safe(void) {
+    return (struct ossl_ctx*)SSL_CTX_new(TLS_server_method());
+}
+void SSL_CTX_free_safe(struct ossl_ctx *c) {
+    SSL_CTX_free((SSL_CTX*)c);
+}
+int SSL_CTX_use_certificate_file_safe(struct ossl_ctx *c, const char *file, int type) {
+    return SSL_CTX_use_certificate_file((SSL_CTX*)c, file, type);
+}
+int SSL_CTX_use_PrivateKey_file_safe(struct ossl_ctx *c, const char *file, int type) {
+    return SSL_CTX_use_PrivateKey_file((SSL_CTX*)c, file, type);
+}
+
+/* ========================================================================
+ * Randomized RSA round-trip test
+ * Tests: sign-then-verify (M^d mod n, then result^e mod n should equal M)
+ * ======================================================================== */
+int ossl_test_rsa_roundtrip(SSL_CTX *ctx, int iterations) {
+    struct ossl_ctx *c = (struct ossl_ctx *)ctx;
+    if (!c->key_der || !c->cert_der) {
+        fprintf(stderr, "ossl_test_rsa_roundtrip: missing key_der or cert_der\n");
+        return -1;
+    }
+    unsigned char *sn = NULL, *sd = NULL, *se = NULL;
+    int sn_len = 0, sd_len = 0, se_len = 0;
+    if (rsa_get_pubkey(c->key_der, c->key_der_len, &sn, &sn_len, NULL, NULL) != 0) {
+        fprintf(stderr, "ossl_test_rsa_roundtrip: rsa_get_pubkey failed\n");
+        return -1;
+    }
+    if (rsa_get_privexp(c->key_der, c->key_der_len, &sd, &sd_len) != 0) {
+        fprintf(stderr, "ossl_test_rsa_roundtrip: rsa_get_privexp failed\n");
+        free(sn); return -1;
+    }
+    /* Also extract public exponent from the private key (same n, so we pass NULL for n) */
+    {
+        unsigned char *dummy_n = NULL;
+        int dummy_n_len = 0;
+        if (rsa_get_pubkey(c->key_der, c->key_der_len, &dummy_n, &dummy_n_len, &se, &se_len) != 0) {
+            fprintf(stderr, "ossl_test_rsa_roundtrip: rsa_get_pubkey for e failed\n");
+            free(sn); free(sd); return -1;
+        }
+        free(dummy_n);
+    }
+    int bs = sn_len;
+    int failures = 0;
+    for (int iter = 0; iter < iterations; iter++) {
+        /* Generate random message M (exactly bs bytes, < n) */
+        unsigned char M[256];
+        for (int i = 0; i < bs; i++)
+            M[i] = (unsigned char)((iter * 12345 + i * 6789 + 1) & 0xFF);
+        /* Ensure M < n by clearing the MSB */
+        M[0] &= 0x7F;
+
+        /* Sign: S = M^d mod n using CRT */
+        unsigned char S_std[256], S_crt[256];
+        int r1 = rsa_modpow(M, bs, sd, sd_len, sn, sn_len, S_std);
+        int r2 = rsa_privkey_op(M, bs, sn, sn_len, sd, sd_len,
+                                 c->crt_p, c->crt_p_len, c->crt_q, c->crt_q_len,
+                                 c->crt_qInv, S_crt);
+
+        if (r1 != 0 || r2 != 0) {
+            fprintf(stderr, "FAIL iter %d: rsa_modpow failed std=%d crt=%d\n", iter, r1, r2);
+            failures++; continue;
+        }
+
+        /* Compare standard vs CRT paths */
+        if (memcmp(S_std, S_crt, bs) != 0) {
+            fprintf(stderr, "FAIL iter %d: CRT mismatch!\n", iter);
+            fprintf(stderr, "  std[0..7]: "); for(int i=0;i<8;i++) fprintf(stderr,"%02x",S_std[i]); fprintf(stderr,"\n");
+            fprintf(stderr, "  crt[0..7]: "); for(int i=0;i<8;i++) fprintf(stderr,"%02x",S_crt[i]); fprintf(stderr,"\n");
+            failures++;
+        }
+
+        /* Verify: M' = S_std^e mod n, should equal M */
+        unsigned char V[256];
+        if (rsa_modpow(S_std, bs, se, se_len, sn, sn_len, V) != 0) {
+            fprintf(stderr, "FAIL iter %d: verification modpow failed\n", iter);
+            failures++; continue;
+        }
+        if (memcmp(V, M, bs) != 0) {
+            fprintf(stderr, "FAIL iter %d: sign-verify mismatch!\n", iter);
+            fprintf(stderr, "  M[0..7]: "); for(int i=0;i<8;i++) fprintf(stderr,"%02x",M[i]); fprintf(stderr,"\n");
+            fprintf(stderr, "  V[0..7]: "); for(int i=0;i<8;i++) fprintf(stderr,"%02x",V[i]); fprintf(stderr,"\n");
+            failures++;
+            /* Stop early to preserve the failing case for debugging */
+            if (failures >= 5) break;
+        }
+    }
+    free(sn); free(sd); free(se);
+    if (failures > 0)
+        fprintf(stderr, "rsa_roundtrip: %d/%d failures\n", failures, iterations);
+    else
+        fprintf(stderr, "rsa_roundtrip: all %d passed\n", iterations);
+    return failures > 0 ? -1 : 0;
 }

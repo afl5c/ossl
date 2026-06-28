@@ -36,11 +36,15 @@ void SSL_free(SSL* ssl);
 int SSL_set_fd(SSL* ssl, int fd);
 
 /* Handshake and I/O */
+#define SSL_ERROR_NONE        0
+#define SSL_ERROR_WANT_READ   2
+#define SSL_ERROR_WANT_WRITE  3
 int SSL_accept(SSL* ssl);
 int SSL_connect(SSL* ssl);
 int SSL_shutdown(SSL* ssl);
 int SSL_read(SSL* ssl, void* buf, int num);
 int SSL_write(SSL* ssl, const void* buf, int num);
+int SSL_get_error(const SSL* ssl, int ret);
 
 /* Verification */
 #define X509_V_OK 0
@@ -88,6 +92,12 @@ int PEM_write_bio_X509(BIO* bp, X509* x);
 long BIO_ctrl(BIO* bp, int cmd, long larg, void* parg);
 int BIO_free(BIO* a);
 void X509_free(X509* a);
+
+/* Test hooks for comparison with OpenSSL */
+int ossl_test_pss_sign(SSL_CTX *ctx, const unsigned char *hash, int hash_len,
+                        unsigned char *sig, int sig_len);
+int ossl_test_rsa_sign(SSL_CTX *ctx, const unsigned char *hash, int hash_len,
+                        unsigned char *sig, int sig_len);
 
 #ifdef __cplusplus
 }

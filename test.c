@@ -69,6 +69,7 @@ static int parse_url(const char *url, char **scheme, char **host, int *port, cha
     /* Find end of host part (next '/' or ':' or end) */
     const char *h_end = host_start;
     while (*h_end && *h_end != '/' && *h_end != ':') h_end++;
+    const char *host_end = h_end; /* save before port parsing moves h_end */
 
     /* Check for port */
     if (*h_end == ':') {
@@ -86,7 +87,7 @@ static int parse_url(const char *url, char **scheme, char **host, int *port, cha
         h_end = p_end;
     }
 
-    size_t host_len = (size_t)(h_end - host_start);
+    size_t host_len = (size_t)(host_end - host_start);
     *host = (char*)malloc(host_len + 1);
     if (!*host) { free(*scheme); return -1; }
     memcpy(*host, host_start, host_len);
